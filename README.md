@@ -9,11 +9,11 @@ The home page, game cards, how-to-play guide, FAQ, responsive layout, and client
 Supabase-dependent functions work only after you configure a project and apply the schema below:
 
 - Load the games and their download links from the `games` table.
-- Sign up and sign in to SpinVault.
+- Sign in to SpinVault with admin-provisioned username/PIN credentials.
 - Use private player-to-admin chat, load/cash-out requests, and realtime updates.
 - Sign in to the admin dashboard at `/admin`.
 
-There are **no default admin or player usernames/passwords**. Create your own accounts using the steps below. The login form uses **email and password**; the username is the display name shown in the portal.
+There are **no default admin or player usernames/PINs**. Players sign in using a custom username and PIN; no player email address is required. Admin-provisioned accounts use the `username@spinvault.local` shadow-email format so the browser still receives a native Supabase session/JWT for RLS, Storage, and Realtime. An existing Supabase Auth player can be converted by resetting its access in the admin console.
 
 The gallery contains ten compact entries as starter records. Only entries with a valid `download_url` open a game link; the included starter titles do not imply that SpinVault distributes those games. Set verified links and icons before publishing the corresponding entries.
 
@@ -21,9 +21,12 @@ The gallery contains ten compact entries as starter records. Only entries with a
 
 ### 1. Create a Supabase project and database
 
-Create a project in Supabase, open its SQL Editor, and run [`supabase/spinvault-schema.sql`](./supabase/spinvault-schema.sql). The script creates `profiles`, `games`, `chat_messages`, and `payment_methods`, creates a profile automatically for each new Supabase Auth user, enables row-level security, and enables Realtime for messages. It adds ten starter game titles without inventing download links.
+Create a project in Supabase, open its SQL Editor, and run these scripts in order:
 
-If you already applied an earlier SpinVault schema, run the current SQL file again to add the request status, payment-method, attachment, Storage, and admin request-processing pieces. The setup is written to be re-runnable.
+1. [`supabase/spinvault-schema.sql`](./supabase/spinvault-schema.sql) creates the portal tables, RLS, Storage, and chat request workflows.
+2. [`supabase/spinvault-pin-auth.sql`](./supabase/spinvault-pin-auth.sql) adds username/PIN Auth, account administration, admin approvals, heartbeats, audit logs, and Super Admin telemetry.
+
+Both scripts are designed to be re-runnable. The PIN migration relies on the base profile trigger and must run after the base schema.
 
 ### 2. Configure the Angular app
 
@@ -41,44 +44,76 @@ supabaseAnonKey: 'your-public-anon-or-publishable-key',
 
 These values are included in the browser bundle and are intended to be public. **Never put a Supabase `service_role` key or database password in the Angular app.** Environment values are compiled into the app at build time, so update the production environment file before running the production build or deploying it.
 
-### 3. Configure Supabase Auth URLs
+### 3. Configure Supabase Auth
 
-In Supabase Authentication settings, set the Site URL to your deployed site and add the local development URL and deployed URL to the allowed redirect URLs. If email confirmation is enabled, users must confirm their email before they can sign in. For a quick test, you can disable email confirmation in the Supabase Auth settings, but enable the appropriate confirmation/security settings for your production use.
+In Supabase Authentication settings, set the Site URL to your deployed site and add the local development URL and deployed URL to the allowed redirect URLs. Admin-provisioned player accounts have confirmed, non-deliverable shadow emails in the reserved `.local` domain. Do not configure email delivery or send mail to `@spinvault.local` accounts. Native Supabase password sign-in issues the actual session JWT; the shadow email is only an Auth identifier, not a player contact address.
 
-### 4. Create the owner/admin login
+### 4. Bootstrap the first Super Admin
 
-There is no pre-created owner account or shared password. Create the owner account through the SpinVault site:
+There is no pre-created owner account or shared credential. Bootstrap one trusted owner account before using the admin player-creation screen:
 
-1. Run the app locally or deploy it after configuring Supabase.
-2. Click **Log in** or **Chat with us**, then select **Create account**.
-3. Create an account with an owner-controlled email, a username such as `spinvault-admin`, and a strong password you choose. The password is not stored in this repository.
-4. Confirm the email first if confirmation is enabled.
-5. In the Supabase SQL Editor, promote that account to admin. Replace the example address with the exact email used at signup:
+1. In Supabase **Authentication → Users**, create an owner account with an owner-controlled email and confirm it.
+2. In the SQL Editor, replace the example email, username, and temporary PIN in this one-time bootstrap with values you control. The PIN must be 6–32 letters/numbers. It converts this account to the shadow-email login and grants the initial Super Admin role:
 
    ```sql
-   update public.profiles
-   set role = 'admin'
-   where id = (
-     select id from auth.users where email = 'owner@your-domain.example'
-   );
+   do $$
+   declare
+     owner_id uuid;
+     owner_name text := 'spinvault-owner';
+     bootstrap_pin text := 'REPLACE_WITH_A_TEMPORARY_PIN';
+     pin_digest text;
+   begin
+     select id into strict owner_id
+     from auth.users
+     where email = 'owner@your-domain.example';
+
+     pin_digest := spinvault_private.crypt(bootstrap_pin, spinvault_private.gen_salt('bf', 12));
+
+     update auth.users
+     set email = owner_name || '@spinvault.local',
+         encrypted_password = pin_digest,
+         email_confirmed_at = coalesce(email_confirmed_at, now()),
+         raw_user_meta_data = coalesce(raw_user_meta_data, '{}'::jsonb)
+           || jsonb_build_object('username', owner_name),
+         updated_at = now()
+     where id = owner_id;
+
+     update auth.identities
+     set provider_id = owner_name || '@spinvault.local',
+         identity_data = coalesce(identity_data, '{}'::jsonb)
+           || jsonb_build_object('email', owner_name || '@spinvault.local'),
+         updated_at = now()
+     where user_id = owner_id and provider = 'email';
+
+     update public.profiles
+     set username = owner_name,
+         custom_username = owner_name,
+         pin_hash = pin_digest,
+         role = 'admin',
+         admin_status = 'approved',
+         is_super_admin = true
+     where id = owner_id;
+   end $$;
    ```
 
-6. Sign in through the SpinVault modal with that **email and the password chosen at signup**, then open `/admin`. The account username is for display; it is not the login identifier.
+3. Sign in at `/pin-login` with the chosen username and temporary PIN. Immediately reset it to a unique, private PIN from `/admin` → **Player access**. Do not keep the bootstrap PIN in shell history, chat, or source control.
 
-Only a trusted project owner should run the promotion SQL. Signup always creates a `player`; the browser signup form does not accept a role.
+Only a trusted database/project owner should run this bootstrap SQL. Never promote users through client-side SQL or expose a service-role key.
 
-### 5. Create player/test logins
+### 5. Create player/test logins and review admins
 
-There are no seeded demo accounts. Create each player account through **Create account** in the SpinVault login/chat modal, using an email you control, a username such as `demo-player`, and a password you choose. Confirm the email first if required, then sign in with that email and password. Repeat with a second email/account if you want to test multiple players.
+There are no seeded demo accounts. After bootstrapping, use `/admin` → **Player access** to create players or reset an existing player's username and PIN. Share credentials directly with that player using a trusted channel; the app never displays a PIN after save. Player usernames are unique and case-insensitive. PINs are bcrypt-hashed in `profiles.pin_hash` and in the native Auth password field; the hash is not selectable through the client API.
 
 For example, you can create:
 
-| Purpose | Example username | Email for signup | Password |
+| Purpose | Example username | Login |
 |---|---|---|---|
-| Owner/admin | `spinvault-admin` | An owner-controlled email | Choose and store a strong password |
-| Test player | `demo-player` | A test email you control | Choose a separate password |
+| Owner/admin | `spinvault-owner` | Username plus a private PIN |
+| Test player | `demo-player` | Username plus a separate private PIN |
 
-These are suggested account names, **not credentials that already exist**. Never use a real personal password in documentation or source control.
+These are suggested account names, **not accounts or credentials that already exist**. `/pin-login` and the **Chat with us** prompt accept username/PIN. Failed PIN checks are rate-limited by username and recorded in the audit stream.
+
+An authenticated player can request admin elevation from the home navigation. Only a Super Admin can approve or reject that request in `/admin` → **Admin approvals**. To designate another trusted Super Admin, a current database owner must update the account using the Supabase SQL Editor; never expose that power through player-facing RPCs.
 
 ### 6. Configure payment instructions and QR codes
 
@@ -104,17 +139,20 @@ Deploy the generated `dist/messenger-frontend/browser` directory to an Angular-c
 ### Feature check
 
 1. Open the deployed home page. Home, Games (the game section), and How to play are Angular navigation links/sections and should navigate without a full-page application error.
-2. With Supabase configured and the SQL applied, create a player and sign in from **Chat with us**. Send a message or a load/cash-out request, then verify it appears in the admin inbox.
+2. With Supabase configured and both SQL scripts applied, create a player under `/admin` → **Player access**, then sign in from **Chat with us** using that username/PIN. Send a message or a load/cash-out request, then verify it appears in the admin inbox.
 3. Sign in as the promoted owner/admin in another browser session and open `/admin`. Select the player conversation, reply, and confirm the player sees the reply in realtime.
-4. Populate a game's `download_url` and optionally `logo_url`, then refresh the game list to verify its compact tile and external link.
-5. As an admin, open a player's pending request, approve or deny it, then mark an approved load as loaded or an approved cash-out as sent. The status update and confirmation message are committed together by a database function.
-6. From either side of a conversation, attach a supported image (JPEG, PNG, WebP, or GIF, up to 5 MB) and check that the other participant can view it. Images and payment QR codes use private Storage buckets and row-level access policies.
+4. In a second player session, sign in with the username/PIN provisioned by the admin; verify private chat, a heartbeat in `profiles.last_seen`, and an updated active-user count in the Super Admin dashboard. Confirm bad PIN attempts appear in **Audit stream**.
+5. Populate a game's `download_url` and optionally `logo_url`, then refresh the game list to verify its compact tile and external link.
+6. As an admin, open a player's pending request, approve or deny it, then mark an approved load as loaded or an approved cash-out as sent. The status update and confirmation message are committed together by a database function.
+7. From either side of a conversation, attach a supported image (JPEG, PNG, WebP, or GIF, up to 5 MB) and check that the other participant can view it. Images and payment QR codes use private Storage buckets and row-level access policies.
 
 The home, gallery, and How to play navigation work after static deployment. **Authentication, live game data, chat, request actions, payment instructions, and uploads require Supabase configuration and the current SQL schema.** A successful Angular build alone does not connect the app to Supabase. The referral banner is promotional copy only; it does not track referrals or issue a bonus.
 
 ## Database and access notes
 
-The SQL schema gives unauthenticated visitors read access to the game list. Authenticated users can read player profiles, players can message admin profiles, and admins can reply to players and read the admin inbox. Request state changes are performed by an admin-checked database function. Chat and QR images use private buckets and storage policies. Profile role changes are not granted to normal users. Configure project-specific Auth, rate limits, backups, and operational policies before production use.
+The SQL schema gives unauthenticated visitors read access to the game list. Player PIN sign-in validates a bcrypt hash and then calls Supabase Auth `signInWithPassword` using the deterministic `username@spinvault.local` identifier; this second step is what creates the GoTrue JWT required by existing RLS, Storage, and Realtime policies. PIN validation is throttled at five failed attempts in a rolling ten-minute window per normalized username. PINs have a 6-character minimum; use a high-entropy alphanumeric PIN and never reuse a personal password.
+
+The migration explicitly withholds `pin_hash` and `last_ip` from client-readable profile columns. Super Admin telemetry is exposed through a role-checked RPC, and audit rows can only be read by admins. `last_ip` is included for future trusted server-side capture; the browser heartbeat does not accept a client-supplied IP as trustworthy. The SQL scripts have not been executed against your live project; apply them to a test Supabase project first, then validate role policies, shadow-email sign-in, account reset, failed-login lockout, Realtime, and storage with separate accounts. Configure backups, Auth security, and log retention before production.
 
 ## Run locally
 

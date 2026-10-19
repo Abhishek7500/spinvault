@@ -2,10 +2,13 @@ import { Component, OnDestroy, OnInit } from '@angular/core';
 import { DatePipe, DecimalPipe } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { RouterLink } from '@angular/router';
+import { Subscription, interval } from 'rxjs';
 import {
+  SpinVaultAuditLog,
   SpinVaultIdentity,
   SpinVaultMessage,
   SpinVaultPaymentMethod,
+  SpinVaultProfile,
   SpinVaultThread,
   SpinVaultService
 } from '../../core/services/spinvault.service';
@@ -29,6 +32,12 @@ type RequestAction = 'approve' | 'deny' | 'loaded' | 'cashout_sent';
       @if (error) { <p class="admin-error" role="alert">{{ error }}</p> }
       <nav class="admin-tabs" aria-label="Admin sections">
         <button type="button" [class.active]="activeTab === 'inbox'" (click)="activeTab = 'inbox'">Player inbox</button>
+        <button type="button" [class.active]="activeTab === 'players'" (click)="openPlayers()">Player access</button>
+        @if (identity?.is_super_admin) {
+          <button type="button" [class.active]="activeTab === 'approvals'" (click)="openApprovals()">Admin approvals</button>
+          <button type="button" [class.active]="activeTab === 'telemetry'" (click)="openTelemetry()">Live users</button>
+        }
+        <button type="button" [class.active]="activeTab === 'audit'" (click)="openAudit()">Audit stream</button>
         <button type="button" [class.active]="activeTab === 'payments'" (click)="openPayments()">Payment methods</button>
       </nav>
       @if (activeTab === 'inbox') {
@@ -93,7 +102,7 @@ type RequestAction = 'approve' | 'deny' | 'loaded' | 'cashout_sent';
           }
         </section>
       </section>
-      } @else {
+      } @else if (activeTab === 'payments') {
           <section class="payments-panel">
             <header class="payments-title"><div><div class="eyebrow"><span></span> PLAYER CHECKOUT DETAILS</div><h2>Payment <em>methods</em></h2><p>Manage instructions and private QR images displayed in player chat.</p></div></header>
             <div class="payments-layout">
@@ -117,6 +126,67 @@ type RequestAction = 'approve' | 'deny' | 'loaded' | 'cashout_sent';
               </section>
             </div>
           </section>
+        } @else if (activeTab === 'players') {
+          <section class="management-panel">
+            <header class="management-title"><div><div class="eyebrow"><span></span> ACCOUNT ACCESS</div><h2>Player <em>credentials</em></h2><p>Create username/PIN access or reset an existing player account.</p></div></header>
+            @if (notice) { <p class="management-notice" role="status">{{ notice }}</p> }
+            <div class="management-grid">
+              <form class="management-card" (ngSubmit)="savePlayerCredentials()">
+                <h3>{{ targetUserId ? 'Reset player access' : 'Create player access' }}</h3>
+                <label>Account
+                  <select name="targetUserId" [(ngModel)]="targetUserId" (ngModelChange)="selectPlayer($event)">
+                    <option [ngValue]="null">Create a new player</option>
+                    @for (player of players; track player.id) {
+                      <option [ngValue]="player.id">{{ player.custom_username || player.username }}</option>
+                    }
+                  </select>
+                </label>
+                <label>Username<input name="newUsername" [(ngModel)]="newUsername" required minlength="3" maxlength="32" pattern="[A-Za-z0-9_-]+" autocomplete="off" /></label>
+                <label>New PIN<input name="newPin" [(ngModel)]="newPin" required minlength="6" maxlength="32" pattern="[A-Za-z0-9]+" autocomplete="new-password" type="password" /></label>
+                <small>Use 6–32 letters or numbers. PINs are never displayed after saving.</small>
+                <button type="submit" [disabled]="savingCredentials">{{ savingCredentials ? 'Saving…' : targetUserId ? 'Reset username and PIN' : 'Create player' }}</button>
+              </form>
+              <section class="management-card player-list-card">
+                <header><h3>Player accounts</h3><button type="button" (click)="openPlayers()">Refresh</button></header>
+                @if (!players.length) { <p class="management-empty">No player accounts found.</p> }
+                @for (player of players; track player.id) {
+                  <article class="player-access-item"><span><strong>{{ player.custom_username || player.username }}</strong><small>{{ player.admin_status || 'none' }} · {{ player.id }}</small></span><button type="button" (click)="editPlayer(player)">Reset access</button></article>
+                }
+              </section>
+            </div>
+          </section>
+        } @else if (activeTab === 'approvals') {
+          <section class="management-panel">
+            <header class="management-title"><div><div class="eyebrow"><span></span> SUPER ADMIN</div><h2>Admin <em>approvals</em></h2><p>Review player requests for administrator access.</p></div><button type="button" (click)="openApprovals()">Refresh queue</button></header>
+            @if (notice) { <p class="management-notice" role="status">{{ notice }}</p> }
+            <div class="management-card queue-card">
+              @if (!adminRequests.length) { <p class="management-empty">No pending admin requests.</p> }
+              @for (request of adminRequests; track request.id) {
+                <article class="approval-item"><div><strong>{{ request.custom_username || request.username }}</strong><small>Requested {{ request.admin_requested_at | date:'medium' }}</small></div><div><button type="button" (click)="reviewRequest(request, true)">Approve</button><button type="button" class="danger-action" (click)="reviewRequest(request, false)">Reject</button></div></article>
+              }
+            </div>
+          </section>
+        } @else if (activeTab === 'telemetry') {
+          <section class="management-panel">
+            <header class="management-title"><div><div class="eyebrow"><span></span> SUPER ADMIN</div><h2>Live <em>telemetry</em></h2><p>Authenticated users seen within the last five minutes. Refreshes automatically.</p></div><button type="button" (click)="openTelemetry()">Refresh</button></header>
+            <div class="metric-card"><span class="metric-number">{{ activeUsers.length }}</span><span class="metric-label">ACTIVE NOW</span><small>Last updated {{ telemetryUpdatedAt | date:'shortTime' }}</small></div>
+            <div class="management-card telemetry-list">
+              @for (user of activeUsers; track user.id) {
+                <article class="player-access-item"><span><strong>{{ user.custom_username || user.username }}</strong><small>Seen {{ user.last_seen | date:'mediumTime' }}</small></span><i>ONLINE</i></article>
+              }
+              @if (!activeUsers.length) { <p class="management-empty">No active sessions in the last five minutes.</p> }
+            </div>
+          </section>
+        } @else if (activeTab === 'audit') {
+          <section class="management-panel">
+            <header class="management-title"><div><div class="eyebrow"><span></span> LIVE DIAGNOSTICS</div><h2>System <em>audit stream</em></h2><p>Recent failed PIN attempts and user-reported errors.</p></div><button type="button" (click)="openAudit()">Refresh</button></header>
+            <div class="management-card audit-list">
+              @for (entry of auditLogs; track entry.id) {
+                <article class="audit-item"><div><strong>{{ entry.event_type.replace('_', ' ') }}</strong><small>{{ entry.username || 'Unknown username' }} · {{ entry.created_at | date:'medium' }}</small></div><p>{{ entry.error_message }}</p></article>
+              }
+              @if (!auditLogs.length) { <p class="management-empty">No recent audit events.</p> }
+            </div>
+          </section>
         }
       <footer class="admin-footer"><a routerLink="/">SpinVault</a><span>Support conversations are visible only to the player and authorized admins.</span></footer>
     </main>
@@ -135,18 +205,20 @@ type RequestAction = 'approve' | 'deny' | 'loaded' | 'cashout_sent';
     .conversation-panel{min-width:0;display:flex;flex-direction:column}.conversation-heading{height:73px;flex:none;border-bottom:1px solid rgba(255,255,255,.07);display:flex;align-items:center;gap:10px;padding:0 17px}.conversation-heading h2{font-size:12px;margin:0}.conversation-heading p{margin:5px 0 0;color:#78d9b2;font-size:9px}.conversation-heading p span{display:inline-block;width:5px;height:5px;border-radius:50%;background:#40e3a8;margin:0 4px 1px 0}.active-avatar{width:32px;height:32px}.private-label{margin-left:auto;color:#77768d;font-size:8px;letter-spacing:1px}
     .admin-messages{flex:1;overflow-y:auto;padding:18px}.admin-message{display:flex;margin:10px 0}.admin-message-mine{justify-content:flex-end}.admin-bubble{max-width:min(82%,500px);padding:10px 12px;background:#1d1e37;border:1px solid rgba(255,255,255,.06);border-radius:11px 11px 11px 3px}.admin-message-mine .admin-bubble{border-color:rgba(255,0,127,.19);background:linear-gradient(130deg,rgba(255,0,127,.12),rgba(98,29,104,.16));border-radius:11px 11px 3px 11px}.admin-bubble>p{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.55}.admin-bubble time{display:block;margin-top:7px;color:#77768e;font-size:8px;text-align:right}.payload-chip{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:8px;padding:6px 7px;border-radius:5px;background:rgba(0,243,255,.07);color:#00e0e8;font-size:8px;font-weight:850;letter-spacing:.5px}.payload-chip strong{color:#f7f5ff;font-size:10px;letter-spacing:0}
     .admin-no-messages{margin:auto;color:#7f7e95;font-size:10px}.admin-composer{display:flex;gap:9px;padding:12px;border-top:1px solid rgba(255,255,255,.07)}.admin-composer input{flex:1;min-width:0;height:39px;border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:0 12px;background:#17182e;color:#fff;outline:none;font:inherit;font-size:10px}.admin-composer input:focus{border-color:rgba(0,243,255,.45)}.admin-composer button{height:39px;border:0;border-radius:8px;padding:0 13px;background:linear-gradient(100deg,#ff007f,#ca0999);color:#fff;font-size:9px;font-weight:800;cursor:pointer}.admin-composer button span{margin-left:9px}.admin-composer button:disabled{opacity:.48}
-    .admin-tabs{max-width:1200px;margin:0 auto 12px;display:flex;gap:8px}.admin-tabs button{border:1px solid rgba(255,255,255,.09);border-radius:7px;padding:9px 12px;background:#15162b;color:#a6a5b9;font-size:10px;font-weight:700;cursor:pointer}.admin-tabs button.active{border-color:rgba(0,243,255,.3);background:rgba(0,243,255,.07);color:#8af5f7}
+    .admin-tabs{max-width:1200px;margin:0 auto 12px;display:flex;gap:8px;overflow-x:auto;padding-bottom:2px}.admin-tabs button{border:1px solid rgba(255,255,255,.09);border-radius:7px;padding:9px 12px;background:#15162b;color:#a6a5b9;font-size:10px;font-weight:700;cursor:pointer}.admin-tabs button.active{border-color:rgba(0,243,255,.3);background:rgba(0,243,255,.07);color:#8af5f7}
     .request-action-row{display:grid;gap:7px;margin:8px 0}.request-state{color:#bcbacf;font-size:8px;text-transform:capitalize}.request-action-row>div{display:flex;flex-wrap:wrap;gap:5px}.request-action-row button{border:1px solid rgba(0,243,255,.18);border-radius:5px;padding:5px 7px;background:rgba(0,243,255,.05);color:#a3eef0;font-size:8px;font-weight:700;cursor:pointer}.request-action-row button:nth-child(2){border-color:rgba(255,75,110,.2);background:rgba(255,75,110,.05);color:#ff9eaf}.request-action-row button:disabled{opacity:.35;cursor:not-allowed}
     .admin-image-link{display:block;margin-top:8px}.admin-image-link img{max-width:240px;max-height:200px;border-radius:7px;object-fit:contain}.admin-attach{width:36px;height:39px;flex:none;display:grid;place-items:center;border:1px solid rgba(0,243,255,.2);border-radius:8px;color:#7cebf0;font-size:15px;cursor:pointer}.admin-attach input{display:none}
     .payments-panel{max-width:1200px;min-height:460px;margin:0 auto;border:1px solid rgba(255,255,255,.09);border-radius:13px;padding:20px;background:rgba(17,18,37,.83)}.payments-title h2{font-size:24px;margin:10px 0 5px}.payments-title h2 em{font-style:normal;color:#ff2c93}.payments-title p{color:#9291a6;font-size:10px;margin:0}.payments-layout{display:grid;grid-template-columns:minmax(230px,.8fr) minmax(0,1.2fr);gap:18px;margin-top:20px}.payment-editor,.payment-list{border:1px solid rgba(255,255,255,.08);border-radius:10px;background:rgba(255,255,255,.02);padding:15px}.payment-editor h3,.payment-list h3{margin:0 0 13px;font-size:12px}.payment-editor>label{display:block;margin:11px 0;color:#bbb9cd;font-size:9px;font-weight:650}.payment-editor input:not([type=checkbox]),.payment-editor textarea{display:block;width:100%;margin-top:6px;border:1px solid rgba(255,255,255,.1);border-radius:7px;padding:9px;background:#15162b;color:#fff;font:inherit;font-size:10px;outline:none}.payment-editor textarea{resize:vertical}.payment-file input{padding:7px!important}.payment-file small{display:block;margin-top:5px;color:#77768b;font-size:8px}.payment-enabled{display:flex!important;align-items:center;gap:7px}.payment-enabled input{accent-color:#ff168b}.payment-editor-actions{display:flex;gap:8px}.payment-editor-actions button,.payment-item>button{border:0;border-radius:6px;padding:9px 10px;background:#d70b91;color:white;font-size:9px;font-weight:750;cursor:pointer}.payment-editor-actions button:disabled{opacity:.5}.payment-editor-actions button+button,.payment-item>button{border:1px solid rgba(0,243,255,.2);background:rgba(0,243,255,.05);color:#9ceff1}.payment-list>header{display:flex;justify-content:space-between}.payment-list>header span{color:#00e5ed;font-size:9px}.payment-item{display:flex;align-items:center;gap:10px;margin-top:8px;padding:10px;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:#17182d}.payment-item>img,.qr-placeholder{width:47px;height:47px;flex:none;border-radius:6px;object-fit:cover}.qr-placeholder{display:grid;place-items:center;background:rgba(0,243,255,.08);color:#00e5ed;font-size:9px}.payment-item>div{flex:1;min-width:0}.payment-item strong{font-size:10px}.payment-item p{margin:4px 0;color:#9998ad;font-size:9px;white-space:pre-wrap;overflow-wrap:anywhere}.payment-item small{color:#57d6a8;font-size:8px}.payment-item small.method-off{color:#ff9baa}.payment-empty{color:#89889d;font-size:10px;line-height:1.6}
     .conversation-placeholder{margin:auto;text-align:center;padding:20px}.placeholder-orb{height:58px;width:58px;margin:0 auto 18px;display:grid;place-items:center;border:1px solid rgba(0,243,255,.24);border-radius:19px;background:rgba(0,243,255,.06);color:#00e5ed;font-size:32px}.conversation-placeholder h2{font-size:19px;margin:0 0 9px}.conversation-placeholder>p{max-width:270px;color:#9392a7;font-size:11px;line-height:1.7}.conversation-placeholder>span{font-size:9px;color:#69687f}.mobile-back{display:none}
     .admin-footer{max-width:1200px;margin:15px auto 0;display:flex;justify-content:space-between;color:#69687e;font-size:9px}.admin-footer a{color:#a19fb3;text-decoration:none}
+    .management-panel{max-width:1200px;min-height:430px;margin:0 auto;padding:20px;border:1px solid rgba(255,255,255,.09);border-radius:13px;background:rgba(17,18,37,.83)}.management-title{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:18px}.management-title h2{margin:10px 0 5px;font-size:24px}.management-title h2 em{font-style:normal;color:#ff2c93}.management-title p{margin:0;color:#9291a6;font-size:10px}.management-title>button,.management-card button{border:1px solid rgba(0,243,255,.22);border-radius:6px;padding:8px 11px;background:rgba(0,243,255,.06);color:#9ceff1;font-size:9px;font-weight:750;cursor:pointer}
+    .management-grid{display:grid;grid-template-columns:minmax(240px,.8fr) minmax(0,1.2fr);gap:15px}.management-card{min-width:0;padding:15px;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:rgba(255,255,255,.02)}.management-card h3,.management-card header h3{margin:0 0 12px;font-size:12px}.management-card>label{display:block;margin:12px 0;color:#bbb9cd;font-size:9px;font-weight:700}.management-card input,.management-card select{display:block;width:100%;height:38px;margin-top:6px;padding:0 10px;border:1px solid rgba(255,255,255,.1);border-radius:7px;background:#15162b;color:#fff;font:inherit;font-size:10px}.management-card>small{display:block;color:#88879d;font-size:8px;line-height:1.5}.management-card>button{margin-top:12px;background:linear-gradient(100deg,#ff007f,#ca0999);border:0;color:#fff}.management-card header{display:flex;align-items:center;justify-content:space-between}.management-card header h3{margin:0}.player-list-card{max-height:410px;overflow:auto}.player-access-item,.approval-item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}.player-access-item:last-child,.approval-item:last-child{border-bottom:0}.player-access-item>span,.approval-item>div:first-child{min-width:0}.player-access-item strong,.player-access-item small,.approval-item strong,.approval-item small{display:block;overflow-wrap:anywhere}.player-access-item strong,.approval-item strong{font-size:10px}.player-access-item small,.approval-item small{margin-top:4px;color:#85849a;font-size:8px}.player-access-item>button{flex:none;padding:6px 8px}.approval-item>div:last-child{display:flex;gap:6px}.approval-item .danger-action{border-color:rgba(255,75,110,.2);background:rgba(255,75,110,.06);color:#ff9eaf}.management-empty{color:#89889d;font-size:10px}.management-notice{margin:0 0 12px;padding:9px;border:1px solid rgba(45,230,163,.18);border-radius:7px;background:rgba(45,230,163,.05);color:#8ce6c2;font-size:10px}.queue-card{max-width:760px}.metric-card{width:min(100%,230px);min-height:110px;margin-bottom:14px;padding:15px;border:1px solid rgba(0,243,255,.17);border-radius:10px;background:linear-gradient(145deg,rgba(0,243,255,.07),rgba(255,0,127,.04))}.metric-number,.metric-label,.metric-card small{display:block}.metric-number{color:#00f3ff;font-size:39px;font-weight:850;line-height:1}.metric-label{margin-top:6px;color:#bcbacf;font-size:8px;font-weight:800;letter-spacing:1.3px}.metric-card small{margin-top:9px;color:#85849a;font-size:8px}.telemetry-list{max-width:760px}.player-access-item i{color:#52dfaf;font-size:8px;font-style:normal;font-weight:800;letter-spacing:1px}.audit-list{max-width:900px;max-height:510px;overflow:auto}.audit-item{padding:11px 0;border-bottom:1px solid rgba(255,255,255,.06)}.audit-item:last-child{border-bottom:0}.audit-item>div{display:flex;justify-content:space-between;gap:10px}.audit-item strong{color:#ff9eaf;font-size:9px;text-transform:capitalize}.audit-item small{color:#85849a;font-size:8px}.audit-item p{margin:6px 0 0;color:#cfceda;font-size:10px;line-height:1.5;overflow-wrap:anywhere}
     @media(max-width:700px){.admin-page{padding:0 12px 16px}.admin-topbar{height:62px}.admin-heading{margin:22px auto 14px}.admin-heading h1{font-size:27px}.admin-status{font-size:7px;padding:7px}.admin-layout{height:calc(100dvh - 160px);min-height:420px;grid-template-columns:1fr}.inbox-panel{border-right:0}.conversation-panel{display:none}.admin-layout.thread-open .inbox-panel{display:none}.admin-layout.thread-open .conversation-panel{display:flex}.mobile-back{display:block;border:0;background:none;color:#00e5ed;font-size:10px;padding:8px 4px 8px 0}.conversation-heading{gap:7px;padding:0 10px}.conversation-heading .active-avatar{width:30px;height:30px}.private-label{font-size:7px}.admin-messages{padding:12px}.admin-footer{gap:12px;line-height:1.5}.admin-footer span{text-align:right}.payments-layout{grid-template-columns:1fr}.payments-panel{padding:13px}.payment-item{gap:7px}.payment-item>button{padding:7px}}
   `]
 })
 export class AdminDashboardComponent implements OnInit, OnDestroy {
   identity: SpinVaultIdentity | null = null;
-  activeTab: 'inbox' | 'payments' = 'inbox';
+  activeTab: 'inbox' | 'payments' | 'players' | 'approvals' | 'telemetry' | 'audit' = 'inbox';
   threads: SpinVaultThread[] = [];
   selectedThread: SpinVaultThread | null = null;
   messages: SpinVaultMessage[] = [];
@@ -164,7 +236,19 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
   qrFile: File | null = null;
   savingPayment = false;
   processingRequestId: string | null = null;
+  players: SpinVaultProfile[] = [];
+  adminRequests: SpinVaultProfile[] = [];
+  activeUsers: SpinVaultProfile[] = [];
+  auditLogs: SpinVaultAuditLog[] = [];
+  targetUserId: string | null = null;
+  newUsername = '';
+  newPin = '';
+  notice = '';
+  savingCredentials = false;
+  telemetryUpdatedAt: Date | null = null;
   private unsubscribeMessages: (() => void) | null = null;
+  private unsubscribeAdminSignals: (() => void) | null = null;
+  private telemetrySubscription: Subscription | null = null;
 
   constructor(private readonly spinVault: SpinVaultService) {}
 
@@ -172,7 +256,7 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
     try {
       await this.spinVault.initialize();
       this.identity = this.spinVault.currentIdentity;
-      if (this.identity?.role !== 'admin') {
+      if (this.identity?.role !== 'admin' && !this.identity?.is_super_admin) {
         this.error = 'This account does not have admin access.';
         return;
       }
@@ -181,6 +265,13 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
         void this.onLiveMessage(message);
       }, (message) => (this.error = message));
       this.paymentMethods = await this.spinVault.loadPaymentMethods(true);
+      await this.refreshAdminSignals();
+      this.unsubscribeAdminSignals = this.spinVault.subscribeToAdminSignals(() => {
+        void this.refreshAdminSignals();
+      }, (message) => (this.error = message));
+      this.telemetrySubscription = interval(60_000).subscribe(() => {
+        if (this.activeTab === 'telemetry' && this.identity?.is_super_admin) void this.openTelemetry();
+      });
     } catch (error) {
       this.error = this.message(error);
       this.loadingInbox = false;
@@ -189,6 +280,112 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.unsubscribeMessages?.();
+    this.unsubscribeAdminSignals?.();
+    this.telemetrySubscription?.unsubscribe();
+  }
+
+  async openPlayers(): Promise<void> {
+    this.activeTab = 'players';
+    this.notice = '';
+    try {
+      this.players = await this.spinVault.loadPlayerProfiles();
+    } catch (error) {
+      this.error = this.message(error);
+    }
+  }
+
+  async openApprovals(): Promise<void> {
+    if (!this.identity?.is_super_admin) return;
+    this.activeTab = 'approvals';
+    try {
+      this.adminRequests = await this.spinVault.loadAdminRequests();
+    } catch (error) {
+      this.error = this.message(error);
+    }
+  }
+
+  async openTelemetry(): Promise<void> {
+    if (!this.identity?.is_super_admin) return;
+    this.activeTab = 'telemetry';
+    try {
+      this.activeUsers = await this.spinVault.loadActiveUsers();
+      this.telemetryUpdatedAt = new Date();
+    } catch (error) {
+      this.error = this.message(error);
+    }
+  }
+
+  async openAudit(): Promise<void> {
+    this.activeTab = 'audit';
+    try {
+      this.auditLogs = await this.spinVault.loadAuditLogs();
+    } catch (error) {
+      this.error = this.message(error);
+    }
+  }
+
+  selectPlayer(userId: string | null): void {
+    this.targetUserId = userId;
+    const player = this.players.find((profile) => profile.id === userId);
+    this.newUsername = player?.custom_username ?? player?.username ?? '';
+    this.newPin = '';
+    this.notice = '';
+  }
+
+  editPlayer(profile: SpinVaultProfile): void {
+    this.targetUserId = profile.id;
+    this.newUsername = profile.custom_username ?? profile.username;
+    this.newPin = '';
+    this.notice = '';
+  }
+
+  async savePlayerCredentials(): Promise<void> {
+    if (this.savingCredentials) return;
+    this.savingCredentials = true;
+    this.error = '';
+    this.notice = '';
+    try {
+      const result = await this.spinVault.upsertPlayerCredentials(
+        this.targetUserId,
+        this.newUsername,
+        this.newPin
+      );
+      this.notice = `Access saved for ${result.username}. Share the username and new PIN with the player securely.`;
+      this.targetUserId = null;
+      this.newUsername = '';
+      this.newPin = '';
+      this.players = await this.spinVault.loadPlayerProfiles();
+    } catch (error) {
+      this.reportError(error);
+    } finally {
+      this.savingCredentials = false;
+    }
+  }
+
+  async reviewRequest(profile: SpinVaultProfile, approve: boolean): Promise<void> {
+    if (!this.identity?.is_super_admin) return;
+    try {
+      await this.spinVault.reviewAdminRequest(profile.id, approve);
+      this.adminRequests = this.adminRequests.filter((request) => request.id !== profile.id);
+      this.notice = `${profile.custom_username || profile.username}'s request was ${approve ? 'approved' : 'rejected'}.`;
+    } catch (error) {
+      this.error = this.message(error);
+    }
+  }
+
+  private async refreshAdminSignals(): Promise<void> {
+    try {
+      this.auditLogs = await this.spinVault.loadAuditLogs();
+      if (this.identity?.is_super_admin) {
+        [this.adminRequests, this.activeUsers] = await Promise.all([
+          this.spinVault.loadAdminRequests(),
+          this.spinVault.loadActiveUsers()
+        ]);
+        this.telemetryUpdatedAt = new Date();
+      }
+    } catch (error) {
+      this.error = this.message(error);
+    }
   }
 
   async refreshInbox(): Promise<void> {
@@ -359,5 +556,12 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
 
   private message(error: unknown): string {
     return error instanceof Error ? error.message : 'Unable to load the support inbox.';
+  }
+
+  private reportError(error: unknown): void {
+    this.error = this.message(error);
+    void this.spinVault.logSystemError(error).catch((loggingError: unknown) => {
+      this.error = `${this.error} (Could not record this error: ${this.message(loggingError)})`;
+    });
   }
 }

@@ -26,7 +26,7 @@ export const adminGuard: CanActivateFn = async () => {
   const router = inject(Router);
   try {
     await spinVault.initialize();
-    return spinVault.currentIdentity?.role === 'admin'
+    return spinVault.currentIdentity?.role === 'admin' || spinVault.currentIdentity?.is_super_admin
       ? true
       : router.createUrlTree(['/']);
   } catch {

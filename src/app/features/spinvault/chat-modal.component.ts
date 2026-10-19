@@ -26,18 +26,15 @@ import {
 
           @if (!identity) {
             <div class="auth-content">
-              <div class="auth-tabs"><button type="button" [class.active]="mode === 'login'" (click)="mode = 'login'; error = ''">Log in</button><button type="button" [class.active]="mode === 'signup'" (click)="mode = 'signup'; error = ''">Create account</button></div>
-              <p class="auth-intro">{{ mode === 'login' ? 'Sign in to message our team directly.' : 'Create an account and get connected with our team.' }}</p>
-              @if (mode === 'signup') {
-                <label>Username<input [(ngModel)]="username" name="username" autocomplete="username" placeholder="Your player name" /></label>
-              }
-              <label>Email address<input [(ngModel)]="email" name="email" type="email" autocomplete="email" placeholder="you@example.com" /></label>
-              <label>Password<input [(ngModel)]="password" name="password" type="password" [autocomplete]="mode === 'login' ? 'current-password' : 'new-password'" placeholder="At least 8 characters" /></label>
+              <p class="auth-intro">Sign in with the username and PIN provided by your SpinVault admin.</p>
+              <label>Username<input [(ngModel)]="username" name="username" autocomplete="username" autocapitalize="none" placeholder="Your player username" /></label>
+              <label>PIN<input [(ngModel)]="pin" name="pin" type="password" autocomplete="current-password" inputmode="text" placeholder="Your 6-32 character PIN" /></label>
               @if (error) { <p class="chat-error" role="alert">{{ error }}</p> }
-              <button class="chat-submit" type="button" [disabled]="busy" (click)="submitAuth()">{{ busy ? 'Please wait…' : mode === 'login' ? 'Log in and chat' : 'Create account' }} <span>→</span></button>
+              <button class="chat-submit" type="button" [disabled]="busy" (click)="submitAuth()">{{ busy ? 'Please wait…' : 'Log in and chat' }} <span>→</span></button>
+              <p class="auth-note">Need an account or a PIN reset? Contact the SpinVault team. <a routerLink="/pin-login" (click)="close()">Open full login</a></p>
               <p class="auth-note">Your conversation is private and only visible to you and the SpinVault team.</p>
             </div>
-          } @else if (identity.role === 'admin') {
+          } @else if (identity.role === 'admin' || identity.is_super_admin) {
             <div class="chat-state"><span class="state-icon">✦</span><h3>You’re signed in as an admin.</h3><p>Open the admin dashboard to manage player conversations.</p><a routerLink="/admin">Go to admin dashboard →</a></div>
           } @else {
             <div class="chat-body">
@@ -119,10 +116,8 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
   @Output() readonly closed = new EventEmitter<void>();
 
   identity: SpinVaultIdentity | null = this.spinVault.currentIdentity;
-  mode: 'login' | 'signup' = 'login';
-  email = '';
   username = '';
-  password = '';
+  pin = '';
   draft = '';
   requestAmount = '25';
   requestType: 'load' | 'cashout' | null = null;
@@ -160,29 +155,14 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
   }
 
   async submitAuth(): Promise<void> {
-    if (!this.email.trim() || !this.password) {
-      this.error = 'Enter your email address and password to continue.';
-      return;
-    }
-    if (this.mode === 'signup' && this.username.trim().length < 3) {
-      this.error = 'Your username must be at least 3 characters.';
-      return;
-    }
-    if (this.mode === 'signup' && this.password.length < 8) {
-      this.error = 'Use a password with at least 8 characters.';
+    if (!this.username.trim() || !this.pin) {
+      this.error = 'Enter your username and PIN to continue.';
       return;
     }
     this.busy = true;
     this.error = '';
     try {
-      if (this.mode === 'login') {
-        await this.spinVault.signIn(this.email.trim(), this.password);
-      } else {
-        const signedIn = await this.spinVault.signUp(this.email.trim(), this.username.trim(), this.password);
-        if (!signedIn) {
-          this.error = 'Account created. Check your email to confirm your account, then log in.';
-        }
-      }
+      await this.spinVault.signInWithPin(this.username, this.pin);
     } catch (error) {
       this.error = this.message(error);
     } finally {
@@ -204,7 +184,7 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
       this.upsertMessage(message);
       this.draft = '';
     } catch (error) {
-      this.error = this.message(error);
+      this.reportError(error);
     } finally {
       this.busy = false;
     }
@@ -225,7 +205,7 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
       this.upsertMessage(message);
       this.requestType = null;
     } catch (error) {
-      this.error = this.message(error);
+      this.reportError(error);
     } finally {
       this.busy = false;
     }
@@ -243,7 +223,7 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
     try {
       this.upsertMessage(await this.spinVault.uploadChatImage(this.adminId, input.files[0]));
     } catch (error) {
-      this.error = this.message(error);
+      this.reportError(error);
     } finally {
       this.uploading = false;
       input.value = '';
@@ -252,7 +232,7 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
 
   private async startChat(): Promise<void> {
     if (!this.identity || this.chatStarted) return;
-    if (this.identity.role === 'admin') {
+    if (this.identity.role === 'admin' || this.identity.is_super_admin) {
       this.close();
       void this.router.navigateByUrl('/admin');
       return;
@@ -273,13 +253,13 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
           try {
             this.upsertMessage(await this.spinVault.resolveMessageAttachment(message));
           } catch (error) {
-            this.error = this.message(error);
+            this.reportError(error);
           }
         }
-      }, (message) => (this.error = message));
+      }, (message) => this.reportError(new Error(message)));
     } catch (error) {
       this.chatStarted = false;
-      this.error = this.message(error);
+      this.reportError(error);
     } finally {
       this.busy = false;
     }
@@ -304,5 +284,12 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
 
   private message(error: unknown): string {
     return error instanceof Error ? error.message : 'Unable to complete this request.';
+  }
+
+  private reportError(error: unknown): void {
+    this.error = this.message(error);
+    void this.spinVault.logSystemError(error).catch((loggingError: unknown) => {
+      this.error = `${this.error} (Could not record this issue: ${this.message(loggingError)})`;
+    });
   }
 }

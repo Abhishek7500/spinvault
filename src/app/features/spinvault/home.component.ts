@@ -40,14 +40,19 @@ const FEATURED_GAMES: SpinVaultGame[] = [
         <div class="sv-nav-actions">
           @if (identity) {
             <span class="sv-user-label">Hi, {{ identity.username }}</span>
-            @if (identity.role === 'admin') {
+            @if (identity.role === 'admin' || identity.is_super_admin) {
               <a class="sv-admin-link" routerLink="/admin">Admin</a>
+            } @else {
+              <button class="sv-login-btn" type="button" [disabled]="identity.admin_status === 'pending'" (click)="requestAdminAccess()">
+                {{ identity.admin_status === 'pending' ? 'Admin request pending' : 'Request admin access' }}
+              </button>
             }
             <button class="sv-login-btn" type="button" (click)="signOut()">Log out</button>
           } @else {
             <button class="sv-login-btn" type="button" (click)="openChat()">Log in</button>
           }
-          <button class="sv-button sv-button-small" type="button" (click)="openChat()">{{ identity?.role === 'admin' ? 'Chat with Users' : 'Chat with us' }} <span>↗</span></button>
+          <button class="sv-button sv-button-small" type="button" (click)="openChat()">{{ identity?.role === 'admin' || identity?.is_super_admin ? 'Chat with Users' : 'Chat with us' }} <span>↗</span></button>
+          @if (adminRequestNotice) { <span class="sv-admin-request-notice" role="status">{{ adminRequestNotice }}</span> }
         </div>
       </header>
 
@@ -184,6 +189,7 @@ export class HomeComponent implements OnInit, OnDestroy {
   chatOpen = false;
   guideOpen = false;
   identity = this.spinVault.currentIdentity;
+  adminRequestNotice = '';
   private identitySubscription: Subscription | null = null;
 
   constructor(private readonly spinVault: SpinVaultService) {}
@@ -231,6 +237,16 @@ export class HomeComponent implements OnInit, OnDestroy {
       await this.spinVault.signOut();
     } catch (error) {
       this.gameError = this.message(error);
+    }
+  }
+
+  async requestAdminAccess(): Promise<void> {
+    this.adminRequestNotice = '';
+    try {
+      await this.spinVault.requestAdminElevation();
+      this.adminRequestNotice = 'Admin access request sent for review.';
+    } catch (error) {
+      this.adminRequestNotice = this.message(error);
     }
   }
 

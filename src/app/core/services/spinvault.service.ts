@@ -1,5 +1,5 @@
 import { Injectable } from '@angular/core';
-import { BehaviorSubject } from 'rxjs';
+import { BehaviorSubject, interval, Subscription } from 'rxjs';
 import { createClient, RealtimeChannel, SupabaseClient, User } from '@supabase/supabase-js';
 import { environment } from '../../../environments/environment';
 
@@ -7,6 +7,11 @@ export interface SpinVaultProfile {
   id: string;
   username: string;
   role: 'player' | 'admin';
+  custom_username?: string | null;
+  admin_status?: 'none' | 'pending' | 'approved' | 'rejected';
+  admin_requested_at?: string | null;
+  is_super_admin?: boolean;
+  last_seen?: string | null;
 }
 
 export interface SpinVaultIdentity extends SpinVaultProfile {
@@ -49,11 +54,21 @@ export interface SpinVaultThread {
   latestMessage: SpinVaultMessage;
 }
 
+export interface SpinVaultAuditLog {
+  id: string;
+  user_id: string | null;
+  username: string | null;
+  event_type: 'login_failed' | 'system_error';
+  error_message: string;
+  created_at: string;
+}
+
 @Injectable({ providedIn: 'root' })
 export class SpinVaultService {
   private readonly identitySubject = new BehaviorSubject<SpinVaultIdentity | null>(null);
   private readonly profileErrorSubject = new BehaviorSubject<string | null>(null);
   private clientInstance: SupabaseClient | null = null;
+  private heartbeatSubscription: Subscription | null = null;
   private initialized = false;
 
   readonly identity$ = this.identitySubject.asObservable();
@@ -71,27 +86,49 @@ export class SpinVaultService {
     if (this.initialized) return;
     const { data, error } = await this.client.auth.getSession();
     if (error) throw error;
-    if (data.session) await this.loadProfile(data.session.user);
+    if (data.session) {
+      await this.loadProfile(data.session.user);
+      this.startHeartbeat();
+    }
     this.client.auth.onAuthStateChange((_event, session) => {
       if (!session) {
+        this.stopHeartbeat();
         this.identitySubject.next(null);
         this.profileErrorSubject.next(null);
         return;
       }
       setTimeout(() => {
-        void this.loadProfile(session.user).catch((error: unknown) => {
-          this.profileErrorSubject.next(this.errorMessage(error));
-        });
+        void this.loadProfile(session.user)
+          .then(() => this.startHeartbeat())
+          .catch((error: unknown) => this.profileErrorSubject.next(this.errorMessage(error)));
       }, 0);
     });
     this.initialized = true;
   }
 
-  async signIn(email: string, password: string): Promise<void> {
-    const { data, error } = await this.client.auth.signInWithPassword({ email, password });
+  async signInWithPin(username: string, pin: string): Promise<void> {
+    const normalizedUsername = username.trim().toLowerCase();
+    if (!/^[a-z0-9_-]{3,32}$/.test(normalizedUsername)) {
+      throw new Error('Enter a username with 3-32 letters, numbers, underscores, or hyphens.');
+    }
+    if (!/^[a-zA-Z0-9]{6,32}$/.test(pin)) {
+      throw new Error('PINs must contain 6-32 letters or numbers.');
+    }
+    const { data: isValid, error: validationError } = await this.client.rpc('login_with_pin', {
+      p_username: normalizedUsername,
+      p_pin: pin
+    });
+    if (validationError) throw validationError;
+    if (isValid !== true) throw new Error('Incorrect username or PIN. Ask an admin for help if needed.');
+
+    const { data, error } = await this.client.auth.signInWithPassword({
+      email: `${normalizedUsername}@spinvault.local`,
+      password: pin
+    });
     if (error) throw error;
     if (!data.user) throw new Error('Sign-in succeeded without a user account.');
     await this.loadProfile(data.user);
+    this.startHeartbeat();
   }
 
   async signUp(email: string, username: string, password: string): Promise<boolean> {
@@ -104,13 +141,107 @@ export class SpinVaultService {
     if (!data.user) throw new Error('Sign-up succeeded without a user account.');
     if (!data.session) return false;
     await this.loadProfile(data.user);
+    this.startHeartbeat();
     return true;
   }
 
   async signOut(): Promise<void> {
     const { error } = await this.client.auth.signOut();
     if (error) throw error;
+    this.stopHeartbeat();
     this.identitySubject.next(null);
+  }
+
+  async logSystemError(error: unknown): Promise<void> {
+    const identity = this.currentIdentity;
+    if (!identity) return;
+    const detail = this.errorMessage(error).slice(0, 1000);
+    const { error: insertError } = await this.client.from('system_audit_logs').insert({
+      user_id: identity.id,
+      username: identity.custom_username ?? identity.username,
+      event_type: 'system_error',
+      error_message: detail
+    });
+    if (insertError) throw insertError;
+  }
+
+  async loadPlayerProfiles(): Promise<SpinVaultProfile[]> {
+    this.requireAdmin();
+    const { data, error } = await this.client
+      .from('profiles')
+      .select('id,username,role,custom_username,admin_status,admin_requested_at,is_super_admin')
+      .eq('role', 'player')
+      .order('username');
+    if (error) throw error;
+    return data as SpinVaultProfile[];
+  }
+
+  async upsertPlayerCredentials(
+    targetUserId: string | null,
+    username: string,
+    pin: string
+  ): Promise<{ id: string; username: string }> {
+    this.requireAdmin();
+    const { data, error } = targetUserId
+      ? await this.client.rpc('admin_upsert_player_credentials', {
+          p_target_user_id: targetUserId,
+          p_new_username: username,
+          p_new_pin: pin
+        })
+      : await this.client.rpc('admin_upsert_player', {
+          p_new_username: username,
+          p_new_pin: pin
+        });
+    if (error) throw error;
+    return data as { id: string; username: string };
+  }
+
+  async loadAdminRequests(): Promise<SpinVaultProfile[]> {
+    this.requireSuperAdmin();
+    const { data, error } = await this.client
+      .from('profiles')
+      .select('id,username,role,custom_username,admin_status,admin_requested_at,is_super_admin')
+      .eq('admin_status', 'pending')
+      .order('admin_requested_at', { ascending: true });
+    if (error) throw error;
+    return data as SpinVaultProfile[];
+  }
+
+  async reviewAdminRequest(userId: string, approve: boolean): Promise<void> {
+    this.requireSuperAdmin();
+    const { error } = await this.client.rpc('review_admin_request', {
+      p_target_user_id: userId,
+      p_approve: approve
+    });
+    if (error) throw error;
+  }
+
+  async requestAdminElevation(): Promise<void> {
+    this.requireIdentity();
+    const { error } = await this.client.rpc('request_admin_elevation');
+    if (error) throw error;
+    const identity = this.currentIdentity;
+    if (identity) {
+      this.identitySubject.next({ ...identity, admin_status: 'pending', admin_requested_at: new Date().toISOString() });
+    }
+  }
+
+  async loadActiveUsers(): Promise<SpinVaultProfile[]> {
+    this.requireSuperAdmin();
+    const { data, error } = await this.client.rpc('get_super_admin_telemetry');
+    if (error) throw error;
+    return data as SpinVaultProfile[];
+  }
+
+  async loadAuditLogs(): Promise<SpinVaultAuditLog[]> {
+    this.requireAdmin();
+    const { data, error } = await this.client
+      .from('system_audit_logs')
+      .select('id,user_id,username,event_type,error_message,created_at')
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (error) throw error;
+    return data as SpinVaultAuditLog[];
   }
 
   async loadGames(): Promise<SpinVaultGame[]> {
@@ -337,6 +468,20 @@ export class SpinVaultService {
     };
   }
 
+  subscribeToAdminSignals(onChange: () => void, onError: (message: string) => void): () => void {
+    this.requireAdmin();
+    const channel = this.client
+      .channel(`spinvault-admin-signals-${crypto.randomUUID()}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, onChange)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'system_audit_logs' }, onChange)
+      .subscribe((status, error) => {
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          onError(error?.message ?? 'Unable to connect to live admin telemetry.');
+        }
+      });
+    return () => { void this.client.removeChannel(channel); };
+  }
+
   private async findAdminProfile(): Promise<SpinVaultProfile> {
     this.requireIdentity();
     const { data, error } = await this.client
@@ -353,7 +498,7 @@ export class SpinVaultService {
   private async loadProfile(user: User): Promise<void> {
     const { data, error } = await this.client
       .from('profiles')
-      .select('id,username,role')
+      .select('id,username,role,custom_username,admin_status,admin_requested_at,is_super_admin')
       .eq('id', user.id)
       .single();
     if (error) throw error;
@@ -397,6 +542,40 @@ export class SpinVaultService {
     const identity = this.identitySubject.value;
     if (!identity) throw new Error('Sign in to use SpinVault chat.');
     return identity;
+  }
+
+  private requireAdmin(): SpinVaultIdentity {
+    const identity = this.requireIdentity();
+    if (identity.role !== 'admin' && !identity.is_super_admin) {
+      throw new Error('Only admins can access this feature.');
+    }
+    return identity;
+  }
+
+  private requireSuperAdmin(): SpinVaultIdentity {
+    const identity = this.requireIdentity();
+    if (!identity.is_super_admin) throw new Error('Only a super admin can access this feature.');
+    return identity;
+  }
+
+  private startHeartbeat(): void {
+    if (this.heartbeatSubscription) return;
+    const sendHeartbeat = async (): Promise<void> => {
+      const { data, error: sessionError } = await this.client.auth.getSession();
+      if (sessionError) throw sessionError;
+      if (!data.session) return;
+      const { error } = await this.client.rpc('update_user_heartbeat');
+      if (error) throw error;
+    };
+    void sendHeartbeat().catch((error: unknown) => this.profileErrorSubject.next(this.errorMessage(error)));
+    this.heartbeatSubscription = interval(60_000).subscribe(() => {
+      void sendHeartbeat().catch((error: unknown) => this.profileErrorSubject.next(this.errorMessage(error)));
+    });
+  }
+
+  private stopHeartbeat(): void {
+    this.heartbeatSubscription?.unsubscribe();
+    this.heartbeatSubscription = null;
   }
 
   private get client(): SupabaseClient {
