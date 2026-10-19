@@ -47,6 +47,7 @@ const FEATURED_GAMES: SpinVaultGame[] = [
                 {{ identity.admin_status === 'pending' ? 'Admin request pending' : 'Request admin access' }}
               </button>
             }
+            <a class="sv-login-btn sv-recovery-link" routerLink="/pin-recovery">Recovery code</a>
             <button class="sv-login-btn" type="button" (click)="signOut()">Log out</button>
           } @else {
             <button class="sv-login-btn" type="button" (click)="openChat()">Log in</button>
@@ -145,6 +146,7 @@ const FEATURED_GAMES: SpinVaultGame[] = [
     .sv-brand-mark{width:34px;height:34px;flex:none;color:#ff3a9e;filter:drop-shadow(0 0 7px rgba(255,0,127,.65)) drop-shadow(0 0 12px rgba(0,243,255,.25));transition:filter .2s,transform .2s}.sv-brand:hover .sv-brand-mark{transform:rotate(-7deg);filter:drop-shadow(0 0 10px rgba(255,0,127,.85)) drop-shadow(0 0 16px rgba(0,243,255,.4))}
     .sv-nav-links{display:flex;gap:35px}.sv-nav-links a,.sv-admin-link{color:#aaa9bf;text-decoration:none;font-size:13px;transition:color .2s}.sv-nav-links a:hover,.sv-admin-link:hover{color:#fff}
     .sv-nav-actions{display:flex;align-items:center;gap:16px}.sv-login-btn{background:none;border:0;color:#dddcec;font:inherit;font-size:13px;cursor:pointer}.sv-user-label{color:#b9b7cf;font-size:12px}.sv-admin-link{color:#00dce8}
+    .sv-recovery-link{text-decoration:none;white-space:nowrap}
     .sv-button,.sv-secondary-button{display:inline-flex;align-items:center;justify-content:center;gap:13px;border:0;border-radius:9px;padding:14px 20px;background:linear-gradient(100deg,#ff007f,#d809a2);box-shadow:0 7px 27px rgba(255,0,127,.24);color:#fff;font-size:13px;font-weight:750;text-decoration:none;cursor:pointer;transition:transform .2s,box-shadow .2s}
     .sv-button:hover,.sv-secondary-button:hover{transform:translateY(-2px);box-shadow:0 10px 32px rgba(255,0,127,.37)}.sv-button-small{padding:11px 15px;font-size:12px}.sv-secondary-button{background:rgba(16,18,39,.7);border:1px solid rgba(0,243,255,.25);box-shadow:none;color:#ecfaff}
     .sv-secondary-button .sv-chat-icon{font-size:21px;color:#00f3ff;line-height:12px}

@@ -16,6 +16,10 @@ export const routes: Routes = [
     loadComponent: () => import('./features/spinvault/pin-login.component').then((m) => m.PinLoginComponent)
   },
   {
+    path: 'pin-recovery',
+    loadComponent: () => import('./features/spinvault/pin-recovery.component').then((m) => m.PinRecoveryComponent)
+  },
+  {
     path: 'admin',
     loadComponent: () => import('./features/spinvault/admin-dashboard.component').then((m) => m.AdminDashboardComponent),
     canActivate: [adminGuard]

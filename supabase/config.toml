@@ -1,0 +1,2 @@
+[functions.recover-spinvault-pin]
+verify_jwt = false

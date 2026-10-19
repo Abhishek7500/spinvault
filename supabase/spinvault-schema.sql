@@ -30,7 +30,7 @@ create table if not exists public.chat_messages (
   content text not null,
   request_type text check (request_type in ('load', 'cashout')),
   amount numeric(12, 2) check (amount is null or amount > 0),
-  request_status text check (request_status in ('pending', 'approved', 'denied', 'loaded', 'cashout_sent')),
+  request_status text check (request_status in ('pending', 'approved', 'denied', 'loaded', 'cashout_sent', 'verification_required')),
   attachment_path text,
   attachment_name text,
   created_at timestamptz not null default now(),
@@ -52,7 +52,7 @@ set request_status = null
 where request_type is null and request_status is not null;
 alter table public.chat_messages drop constraint if exists chat_messages_request_status_check;
 alter table public.chat_messages add constraint chat_messages_request_status_check
-  check (request_status is null or request_status in ('pending', 'approved', 'denied', 'loaded', 'cashout_sent'));
+  check (request_status is null or request_status in ('pending', 'approved', 'denied', 'loaded', 'cashout_sent', 'verification_required'));
 alter table public.chat_messages drop constraint if exists chat_messages_request_status_consistent;
 alter table public.chat_messages add constraint chat_messages_request_status_consistent
   check (
@@ -208,11 +208,14 @@ begin
     raise exception 'Request was not found or is not assigned to this admin';
   end if;
 
-  if action is null or action not in ('approve', 'deny', 'loaded', 'cashout_sent') then
+  if action is null or action not in ('approve', 'deny', 'loaded', 'cashout_sent', 'verification_required') then
     raise exception 'Unsupported request action';
   end if;
-  if request_row.request_status is distinct from 'pending' and action in ('approve', 'deny') then
-    raise exception 'Only pending requests can be approved or denied';
+  if request_row.request_status not in ('pending', 'verification_required') and action in ('approve', 'deny') then
+    raise exception 'Only pending or verification-required requests can be approved or denied';
+  end if;
+  if action = 'verification_required' and request_row.request_status not in ('pending', 'approved') then
+    raise exception 'Verification can only be requested for pending or approved requests';
   end if;
   if action = 'loaded' and (request_row.request_type <> 'load' or request_row.request_status <> 'approved') then
     raise exception 'Approve a load request before marking it loaded';
@@ -225,6 +228,7 @@ begin
     when 'approve' then 'approved'
     when 'deny' then 'denied'
     when 'loaded' then 'loaded'
+    when 'verification_required' then 'verification_required'
     else 'cashout_sent'
   end;
 
@@ -237,6 +241,7 @@ begin
     when 'approved' then 'Your ' || case request_row.request_type when 'load' then 'load' else 'cash-out' end || ' request was approved.'
     when 'denied' then 'Your ' || case request_row.request_type when 'load' then 'load' else 'cash-out' end || ' request was denied. Please contact support if you have questions.'
     when 'loaded' then 'Your requested load has been marked as loaded.'
+    when 'verification_required' then 'Your request needs additional verification. Please reply here or contact SpinVault support.'
     else 'Your cash-out has been marked as sent.'
   end;
 

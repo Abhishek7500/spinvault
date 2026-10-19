@@ -30,6 +30,7 @@ revoke all on function spinvault_private.gen_salt(text, integer) from public, an
 
 alter table public.profiles
   add column if not exists pin_hash text,
+  add column if not exists recovery_pin text,
   add column if not exists custom_username text,
   add column if not exists admin_status text not null default 'none',
   add column if not exists admin_requested_at timestamptz,
@@ -54,6 +55,16 @@ create table if not exists public.system_audit_logs (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.spinvault_announcements (
+  id boolean primary key default true check (id),
+  body text not null check (length(body) between 1 and 500),
+  updated_by uuid not null references public.profiles(id),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.spinvault_announcements enable row level security;
+grant select on public.spinvault_announcements to authenticated;
+grant insert, update, delete on public.spinvault_announcements to authenticated;
 create index if not exists system_audit_logs_created_at_idx
   on public.system_audit_logs (created_at desc);
 create index if not exists system_audit_logs_user_id_created_at_idx
@@ -72,6 +83,16 @@ create table if not exists public.spinvault_login_throttles (
 );
 alter table public.spinvault_login_throttles enable row level security;
 revoke all on public.spinvault_login_throttles from public, anon, authenticated;
+
+create table if not exists public.spinvault_recovery_throttles (
+  username_key text not null,
+  ip_hash text not null,
+  attempts integer not null default 0,
+  window_started_at timestamptz not null default now(),
+  primary key (username_key, ip_hash)
+);
+alter table public.spinvault_recovery_throttles enable row level security;
+revoke all on public.spinvault_recovery_throttles from public, anon, authenticated;
 
 create or replace function public.spinvault_is_admin(p_user_id uuid default auth.uid())
 returns boolean
@@ -104,6 +125,15 @@ revoke all on function public.spinvault_is_super_admin(uuid) from public, anon;
 grant execute on function public.spinvault_is_admin(uuid) to authenticated;
 grant execute on function public.spinvault_is_super_admin(uuid) to authenticated;
 
+drop policy if exists "Authenticated users read announcement" on public.spinvault_announcements;
+create policy "Authenticated users read announcement"
+  on public.spinvault_announcements for select to authenticated using (true);
+drop policy if exists "Admins manage announcement" on public.spinvault_announcements;
+create policy "Admins manage announcement"
+  on public.spinvault_announcements for all to authenticated
+  using (public.spinvault_is_admin())
+  with check (public.spinvault_is_admin() and updated_by = (select auth.uid()));
+
 drop policy if exists "Authenticated users can read profiles" on public.profiles;
 create policy "Users read own profiles and admins read all"
   on public.profiles for select to authenticated
@@ -130,7 +160,7 @@ revoke update on public.profiles from authenticated;
 grant update (username) on public.profiles to authenticated;
 
 create or replace function public.login_with_pin(p_username text, p_pin text)
-returns boolean
+returns jsonb
 language plpgsql
 security definer
 set search_path = ''
@@ -139,11 +169,12 @@ declare
   normalized_username text := lower(trim(coalesce(p_username, '')));
   matched_profile public.profiles%rowtype;
   throttle_row public.spinvault_login_throttles%rowtype;
+  attempts integer;
 begin
   if normalized_username = '' or normalized_username !~ '^[a-z0-9_-]{3,32}$' then
     insert into public.system_audit_logs (username, event_type, error_message)
     values (nullif(normalized_username, ''), 'login_failed', 'Invalid username or PIN');
-    return false;
+    return pg_catalog.jsonb_build_object('success', false, 'remaining_attempts', 0, 'retry_after_seconds', 0);
   end if;
 
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(normalized_username, 0));
@@ -155,7 +186,11 @@ begin
   if found and throttle_row.locked_until > pg_catalog.now() then
     insert into public.system_audit_logs (username, event_type, error_message)
     values (normalized_username, 'login_failed', 'Too many failed attempts; try again later');
-    return false;
+    return pg_catalog.jsonb_build_object(
+      'success', false,
+      'remaining_attempts', 0,
+      'retry_after_seconds', greatest(1, ceil(extract(epoch from (throttle_row.locked_until - pg_catalog.now())))::integer)
+    );
   end if;
 
   select * into matched_profile
@@ -166,7 +201,7 @@ begin
     and matched_profile.pin_hash is not null
     and matched_profile.pin_hash = spinvault_private.crypt(p_pin, matched_profile.pin_hash) then
     delete from public.spinvault_login_throttles where username_key = normalized_username;
-    return true;
+    return pg_catalog.jsonb_build_object('success', true, 'remaining_attempts', 5, 'retry_after_seconds', 0);
   end if;
 
   insert into public.spinvault_login_throttles as throttle
@@ -187,14 +222,126 @@ begin
           else null
         end;
 
+  select failed_attempts into attempts
+  from public.spinvault_login_throttles
+  where username_key = normalized_username;
+
   insert into public.system_audit_logs (user_id, username, event_type, error_message)
   values (matched_profile.id, normalized_username, 'login_failed', 'Invalid username or PIN');
-  return false;
+  return pg_catalog.jsonb_build_object(
+    'success', false,
+    'remaining_attempts', greatest(0, 5 - attempts),
+    'retry_after_seconds', case when attempts >= 5 then 600 else 0 end
+  );
 end;
 $$;
 
 revoke all on function public.login_with_pin(text, text) from public;
 grant execute on function public.login_with_pin(text, text) to anon, authenticated;
+
+create or replace function public.set_recovery_pin(p_recovery_pin text)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  active_user_id uuid := auth.uid();
+  profile_row public.profiles%rowtype;
+begin
+  if active_user_id is null then raise exception 'Authentication is required'; end if;
+  if p_recovery_pin is null or p_recovery_pin !~ '^[A-Za-z0-9]{8,32}$' then
+    raise exception 'Recovery code must be 8-32 letters or numbers';
+  end if;
+  select * into profile_row from public.profiles where id = active_user_id for update;
+  if not found or profile_row.pin_hash = spinvault_private.crypt(p_recovery_pin, profile_row.pin_hash) then
+    raise exception 'Choose a recovery code different from your login PIN';
+  end if;
+  update public.profiles
+  set recovery_pin = spinvault_private.crypt(p_recovery_pin, spinvault_private.gen_salt('bf', 12))
+  where id = active_user_id;
+end;
+$$;
+revoke all on function public.set_recovery_pin(text) from public, anon;
+grant execute on function public.set_recovery_pin(text) to authenticated;
+
+create or replace function public.consume_recovery_attempt(p_username text, p_ip_hash text)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  attempt_count integer;
+  normalized_username text := lower(trim(coalesce(p_username, '')));
+begin
+  if coalesce(auth.role(), '') <> 'service_role' then raise exception 'Not authorized'; end if;
+  if normalized_username !~ '^[a-z0-9_-]{3,32}$'
+    or p_ip_hash is null or p_ip_hash !~ '^[a-f0-9]{64}$' then
+    return false;
+  end if;
+  insert into public.spinvault_recovery_throttles as throttle
+    (username_key, ip_hash, attempts, window_started_at)
+  values (normalized_username, p_ip_hash, 1, pg_catalog.now())
+  on conflict (username_key, ip_hash) do update
+    set attempts = case
+          when throttle.window_started_at < pg_catalog.now() - interval '15 minutes' then 1
+          else throttle.attempts + 1
+        end,
+        window_started_at = case
+          when throttle.window_started_at < pg_catalog.now() - interval '15 minutes' then pg_catalog.now()
+          else throttle.window_started_at
+        end
+  returning attempts into attempt_count;
+  return attempt_count <= 3;
+end;
+$$;
+revoke all on function public.consume_recovery_attempt(text, text) from public, anon, authenticated;
+grant execute on function public.consume_recovery_attempt(text, text) to service_role;
+
+create or replace function public.recover_spinvault_pin(
+  p_username text,
+  p_recovery_pin text,
+  p_new_pin text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  profile_row public.profiles%rowtype;
+  normalized_username text := lower(trim(coalesce(p_username, '')));
+  new_hash text;
+begin
+  if coalesce(auth.role(), '') <> 'service_role' then raise exception 'Not authorized'; end if;
+  if normalized_username !~ '^[a-z0-9_-]{3,32}$'
+    or p_recovery_pin is null or p_new_pin is null
+    or p_new_pin !~ '^[A-Za-z0-9]{6,32}$' then
+    return false;
+  end if;
+  select * into profile_row from public.profiles
+  where lower(custom_username) = normalized_username
+  for update;
+  if not found or profile_row.recovery_pin is null
+    or profile_row.recovery_pin <> spinvault_private.crypt(p_recovery_pin, profile_row.recovery_pin) then
+    insert into public.system_audit_logs (user_id, username, event_type, error_message)
+    values (profile_row.id, normalized_username, 'login_failed', 'PIN recovery verification failed');
+    return false;
+  end if;
+  new_hash := spinvault_private.crypt(p_new_pin, spinvault_private.gen_salt('bf', 12));
+  update auth.users
+  set encrypted_password = new_hash,
+      updated_at = pg_catalog.now()
+  where id = profile_row.id
+    and email = normalized_username || '@spinvault.local';
+  if not found then raise exception 'Auth account is unavailable for recovery'; end if;
+  update public.profiles set pin_hash = new_hash where id = profile_row.id;
+  return true;
+end;
+$$;
+revoke all on function public.recover_spinvault_pin(text, text, text) from public, anon, authenticated;
+grant execute on function public.recover_spinvault_pin(text, text, text) to service_role;
 
 create or replace function public.admin_upsert_player_credentials(
   p_target_user_id uuid,
@@ -436,6 +583,15 @@ begin
         and tablename = 'profiles'
     ) then
     alter publication supabase_realtime add table public.profiles;
+  end if;
+  if exists (select 1 from pg_publication where pubname = 'supabase_realtime')
+    and not exists (
+      select 1 from pg_publication_tables
+      where pubname = 'supabase_realtime'
+        and schemaname = 'public'
+        and tablename = 'spinvault_announcements'
+    ) then
+    alter publication supabase_realtime add table public.spinvault_announcements;
   end if;
 end;
 $$;

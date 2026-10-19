@@ -5,6 +5,7 @@ import { RouterLink } from '@angular/router';
 import { Subscription, interval } from 'rxjs';
 import {
   SpinVaultAuditLog,
+  SpinVaultAnnouncement,
   SpinVaultIdentity,
   SpinVaultMessage,
   SpinVaultPaymentMethod,
@@ -13,7 +14,7 @@ import {
   SpinVaultService
 } from '../../core/services/spinvault.service';
 
-type RequestAction = 'approve' | 'deny' | 'loaded' | 'cashout_sent';
+type RequestAction = 'approve' | 'deny' | 'loaded' | 'cashout_sent' | 'verification_required';
 
 @Component({
   selector: 'app-admin-dashboard',
@@ -39,6 +40,7 @@ type RequestAction = 'approve' | 'deny' | 'loaded' | 'cashout_sent';
         }
         <button type="button" [class.active]="activeTab === 'audit'" (click)="openAudit()">Audit stream</button>
         <button type="button" [class.active]="activeTab === 'payments'" (click)="openPayments()">Payment methods</button>
+        <button type="button" [class.active]="activeTab === 'announcements'" (click)="openAnnouncements()">Pinned notice</button>
       </nav>
       @if (activeTab === 'inbox') {
       <section class="admin-layout" [class.thread-open]="selectedThread">
@@ -68,9 +70,13 @@ type RequestAction = 'approve' | 'deny' | 'loaded' | 'cashout_sent';
               <div><h2>{{ active.profile.username }}</h2><p><span></span> Private conversation</p></div>
               <span class="private-label">1-ON-1 PRIVATE CHAT</span>
             </header>
+            @if (announcement) { <aside class="admin-pinned" role="status">📌 {{ announcement.body }}</aside> }
+            @if (!online) { <p class="admin-offline" role="status">Offline — reconnect to send messages or update requests.</p> }
+            <label class="admin-search">Search messages<input name="messageSearch" [(ngModel)]="searchQuery" placeholder="Keyword, amount, load, cash-out…" /></label>
             <div class="admin-messages" aria-live="polite">
               @if (!messages.length) { <div class="admin-no-messages">No messages in this conversation yet.</div> }
-              @for (message of messages; track message.id) {
+              @if (messages.length && !filteredMessages.length) { <div class="admin-no-messages">No messages match your search.</div> }
+              @for (message of filteredMessages; track message.id) {
                 <article class="admin-message" [class.admin-message-mine]="message.sender_id === identity?.id">
                   <div class="admin-bubble">
                     @if (message.request_type) {
@@ -80,23 +86,31 @@ type RequestAction = 'approve' | 'deny' | 'loaded' | 'cashout_sent';
                         <div>
                           <button type="button" [disabled]="requestActionDisabled(message, 'approve')" (click)="processRequest(message, 'approve')">Approve</button>
                           <button type="button" [disabled]="requestActionDisabled(message, 'deny')" (click)="processRequest(message, 'deny')">Deny</button>
-                          <button type="button" [disabled]="requestActionDisabled(message, 'loaded')" (click)="processRequest(message, 'loaded')">Mark as Loaded</button>
-                          <button type="button" [disabled]="requestActionDisabled(message, 'cashout_sent')" (click)="processRequest(message, 'cashout_sent')">Cashout Sent</button>
+                          <button type="button" [disabled]="requestActionDisabled(message, 'loaded')" (click)="processRequest(message, 'loaded')">Loaded!! Goodluck 🍀</button>
+                          <button type="button" [disabled]="requestActionDisabled(message, 'cashout_sent')" (click)="processRequest(message, 'cashout_sent')">Cash out Completed 💸</button>
+                          <button type="button" [disabled]="requestActionDisabled(message, 'verification_required')" (click)="processRequest(message, 'verification_required')">Verification Required ⚠️</button>
                         </div>
                       </div>
                     }
                     <p>{{ message.content }}</p>
                     @if (message.attachment_url) { <a class="admin-image-link" [href]="message.attachment_url" target="_blank" rel="noopener noreferrer"><img [src]="message.attachment_url" [alt]="message.attachment_name || 'Chat image'" loading="lazy" /></a> }
+                    @if (message.delivery_status === 'pending') { <small class="message-delivery">Sending…</small> }
+                    @if (message.delivery_status === 'failed') { <small class="message-delivery failed">Not sent · reconnect and retry</small> }
                     <time>{{ message.created_at | date:'medium' }}</time>
                   </div>
                 </article>
               }
             </div>
+            @if (otherTyping) { <p class="admin-typing">{{ active.profile.username }} is typing…</p> }
+            @if (previewUrl) {
+              <div class="admin-image-preview"><img [src]="previewUrl" alt="Selected image preview" [style.transform]="'scale(' + imageZoom + ')'" /><label>Crop zoom<input type="range" min="1" max="1.5" step="0.05" [(ngModel)]="imageZoom" name="imageZoom" /></label><button type="button" (click)="cancelImagePreview()">Remove</button><button type="button" [disabled]="uploading || !online" (click)="uploadPreview()">Send image</button></div>
+            }
             <form class="admin-composer" (ngSubmit)="sendReply()">
-              <input name="reply" [(ngModel)]="reply" placeholder="Write a reply to {{ active.profile.username }}…" aria-label="Reply to player" autocomplete="off" />
-              <label class="admin-attach" title="Attach an image"><input type="file" accept="image/jpeg,image/png,image/webp,image/gif" (change)="sendImage($event)" [disabled]="sending || uploading" />{{ uploading ? '…' : '▧' }}</label>
-              <button type="submit" [disabled]="sending || !reply.trim()">{{ sending ? 'Sending…' : 'Send reply' }} <span>↑</span></button>
+              <input name="reply" [(ngModel)]="reply" (input)="onTyping()" placeholder="Write a reply to {{ active.profile.username }}…" aria-label="Reply to player" autocomplete="off" />
+              <label class="admin-attach" title="Attach an image"><input type="file" accept="image/jpeg,image/png,image/webp,image/gif" (change)="selectImage($event)" [disabled]="sending || uploading" />{{ uploading ? '…' : '▧' }}</label>
+              <button type="submit" [disabled]="sending || !online || !reply.trim()">{{ sending ? 'Sending…' : 'Send reply' }} <span>↑</span></button>
             </form>
+            <div class="canned-replies"><button type="button" (click)="sendCannedReply('Loaded!! Goodluck 🍀')">Loaded!! Goodluck 🍀</button><button type="button" (click)="sendCannedReply('Cash out Completed 💸')">Cash out Completed 💸</button><button type="button" (click)="sendCannedReply('Verification Required ⚠️')">Verification Required ⚠️</button></div>
           } @else {
             <div class="conversation-placeholder"><div class="placeholder-orb">⌁</div><h2>Your support, <em>in sync.</em></h2><p>Select a player from the inbox to open their private conversation.</p><span>Messages update automatically in real time.</span></div>
           }
@@ -125,6 +139,12 @@ type RequestAction = 'approve' | 'deny' | 'loaded' | 'cashout_sent';
                 }
               </section>
             </div>
+          </section>
+        } @else if (activeTab === 'announcements') {
+          <section class="management-panel">
+            <header class="management-title"><div><div class="eyebrow"><span></span> PLAYER CHAT</div><h2>Pinned <em>announcement</em></h2><p>This notice appears at the top of every player support conversation.</p></div></header>
+            <form class="announcement-editor" (ngSubmit)="saveAnnouncement()"><label>Notice<textarea name="announcementBody" [(ngModel)]="announcementDraft" maxlength="500" rows="4" placeholder="Share rules, service updates, or bonus information."></textarea></label><small>{{ announcementDraft.length }}/500 characters</small><div><button type="submit" [disabled]="savingAnnouncement">{{ savingAnnouncement ? 'Saving…' : 'Pin announcement' }}</button><button type="button" (click)="clearAnnouncement()" [disabled]="savingAnnouncement || !announcement">Remove announcement</button></div></form>
+            @if (announcement) { <aside class="admin-pinned announcement-current">📌 {{ announcement.body }}</aside> }
           </section>
         } @else if (activeTab === 'players') {
           <section class="management-panel">
@@ -208,6 +228,7 @@ type RequestAction = 'approve' | 'deny' | 'loaded' | 'cashout_sent';
     .admin-tabs{max-width:1200px;margin:0 auto 12px;display:flex;gap:8px;overflow-x:auto;padding-bottom:2px}.admin-tabs button{border:1px solid rgba(255,255,255,.09);border-radius:7px;padding:9px 12px;background:#15162b;color:#a6a5b9;font-size:10px;font-weight:700;cursor:pointer}.admin-tabs button.active{border-color:rgba(0,243,255,.3);background:rgba(0,243,255,.07);color:#8af5f7}
     .request-action-row{display:grid;gap:7px;margin:8px 0}.request-state{color:#bcbacf;font-size:8px;text-transform:capitalize}.request-action-row>div{display:flex;flex-wrap:wrap;gap:5px}.request-action-row button{border:1px solid rgba(0,243,255,.18);border-radius:5px;padding:5px 7px;background:rgba(0,243,255,.05);color:#a3eef0;font-size:8px;font-weight:700;cursor:pointer}.request-action-row button:nth-child(2){border-color:rgba(255,75,110,.2);background:rgba(255,75,110,.05);color:#ff9eaf}.request-action-row button:disabled{opacity:.35;cursor:not-allowed}
     .admin-image-link{display:block;margin-top:8px}.admin-image-link img{max-width:240px;max-height:200px;border-radius:7px;object-fit:contain}.admin-attach{width:36px;height:39px;flex:none;display:grid;place-items:center;border:1px solid rgba(0,243,255,.2);border-radius:8px;color:#7cebf0;font-size:15px;cursor:pointer}.admin-attach input{display:none}
+    .admin-pinned,.admin-offline{flex:none;margin:9px 14px 0;padding:8px 10px;border:1px solid rgba(0,243,255,.2);border-radius:7px;background:rgba(0,243,255,.06);color:#b4f9fa;font-size:9px;line-height:1.5}.admin-offline{border-color:rgba(255,175,60,.28);background:rgba(255,175,60,.08);color:#ffd39b}.admin-search{flex:none;padding:8px 14px 0;color:#a4a3b6;font-size:9px}.admin-search input{display:block;width:100%;height:32px;margin-top:5px;padding:0 9px;border:1px solid rgba(255,255,255,.1);border-radius:7px;background:#18192e;color:#e9e8f3;font:inherit}.admin-typing{flex:none;margin:0 17px 7px;color:#80e9ed;font-size:9px}.message-delivery{display:block;color:#91dadd;font-size:8px}.message-delivery.failed{color:#ff9cab}.admin-image-preview{display:grid;grid-template-columns:64px 1fr auto auto;align-items:center;gap:8px;margin:0 16px 8px;padding:7px;border:1px solid rgba(0,243,255,.16);border-radius:8px;background:#18192e}.admin-image-preview img{width:58px;height:48px;object-fit:cover;border-radius:5px}.admin-image-preview label{color:#aaa9bb;font-size:8px}.admin-image-preview label input{display:block;width:100%}.admin-image-preview button,.canned-replies button{border:0;background:transparent;color:#8cecf0;font-size:8px;cursor:pointer}.canned-replies{display:flex;flex-wrap:wrap;gap:5px;padding:0 16px 9px}.canned-replies button{padding:5px 7px;border:1px solid rgba(0,243,255,.15);border-radius:6px;background:rgba(0,243,255,.04)}.announcement-editor{max-width:700px;padding:19px;border:1px solid rgba(255,255,255,.09);border-radius:12px;background:#121329}.announcement-editor label{display:grid;gap:8px;color:#d4d3e0;font-size:11px;font-weight:700}.announcement-editor textarea{padding:11px;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:#0e0f20;color:#fff;font:inherit;font-size:12px;resize:vertical}.announcement-editor small{display:block;margin:7px 0;color:#88879a;font-size:9px}.announcement-editor>div{display:flex;gap:8px}.announcement-editor button{min-height:36px;padding:0 11px;border:0;border-radius:7px;background:#ff168b;color:#fff;font-size:9px;font-weight:750;cursor:pointer}.announcement-editor button+button{border:1px solid rgba(255,255,255,.13);background:transparent;color:#c1c0d0}.announcement-current{margin:16px 0;max-width:700px}
     .payments-panel{max-width:1200px;min-height:460px;margin:0 auto;border:1px solid rgba(255,255,255,.09);border-radius:13px;padding:20px;background:rgba(17,18,37,.83)}.payments-title h2{font-size:24px;margin:10px 0 5px}.payments-title h2 em{font-style:normal;color:#ff2c93}.payments-title p{color:#9291a6;font-size:10px;margin:0}.payments-layout{display:grid;grid-template-columns:minmax(230px,.8fr) minmax(0,1.2fr);gap:18px;margin-top:20px}.payment-editor,.payment-list{border:1px solid rgba(255,255,255,.08);border-radius:10px;background:rgba(255,255,255,.02);padding:15px}.payment-editor h3,.payment-list h3{margin:0 0 13px;font-size:12px}.payment-editor>label{display:block;margin:11px 0;color:#bbb9cd;font-size:9px;font-weight:650}.payment-editor input:not([type=checkbox]),.payment-editor textarea{display:block;width:100%;margin-top:6px;border:1px solid rgba(255,255,255,.1);border-radius:7px;padding:9px;background:#15162b;color:#fff;font:inherit;font-size:10px;outline:none}.payment-editor textarea{resize:vertical}.payment-file input{padding:7px!important}.payment-file small{display:block;margin-top:5px;color:#77768b;font-size:8px}.payment-enabled{display:flex!important;align-items:center;gap:7px}.payment-enabled input{accent-color:#ff168b}.payment-editor-actions{display:flex;gap:8px}.payment-editor-actions button,.payment-item>button{border:0;border-radius:6px;padding:9px 10px;background:#d70b91;color:white;font-size:9px;font-weight:750;cursor:pointer}.payment-editor-actions button:disabled{opacity:.5}.payment-editor-actions button+button,.payment-item>button{border:1px solid rgba(0,243,255,.2);background:rgba(0,243,255,.05);color:#9ceff1}.payment-list>header{display:flex;justify-content:space-between}.payment-list>header span{color:#00e5ed;font-size:9px}.payment-item{display:flex;align-items:center;gap:10px;margin-top:8px;padding:10px;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:#17182d}.payment-item>img,.qr-placeholder{width:47px;height:47px;flex:none;border-radius:6px;object-fit:cover}.qr-placeholder{display:grid;place-items:center;background:rgba(0,243,255,.08);color:#00e5ed;font-size:9px}.payment-item>div{flex:1;min-width:0}.payment-item strong{font-size:10px}.payment-item p{margin:4px 0;color:#9998ad;font-size:9px;white-space:pre-wrap;overflow-wrap:anywhere}.payment-item small{color:#57d6a8;font-size:8px}.payment-item small.method-off{color:#ff9baa}.payment-empty{color:#89889d;font-size:10px;line-height:1.6}
     .conversation-placeholder{margin:auto;text-align:center;padding:20px}.placeholder-orb{height:58px;width:58px;margin:0 auto 18px;display:grid;place-items:center;border:1px solid rgba(0,243,255,.24);border-radius:19px;background:rgba(0,243,255,.06);color:#00e5ed;font-size:32px}.conversation-placeholder h2{font-size:19px;margin:0 0 9px}.conversation-placeholder>p{max-width:270px;color:#9392a7;font-size:11px;line-height:1.7}.conversation-placeholder>span{font-size:9px;color:#69687f}.mobile-back{display:none}
     .admin-footer{max-width:1200px;margin:15px auto 0;display:flex;justify-content:space-between;color:#69687e;font-size:9px}.admin-footer a{color:#a19fb3;text-decoration:none}
@@ -218,11 +239,19 @@ type RequestAction = 'approve' | 'deny' | 'loaded' | 'cashout_sent';
 })
 export class AdminDashboardComponent implements OnInit, OnDestroy {
   identity: SpinVaultIdentity | null = null;
-  activeTab: 'inbox' | 'payments' | 'players' | 'approvals' | 'telemetry' | 'audit' = 'inbox';
+  activeTab: 'inbox' | 'payments' | 'players' | 'approvals' | 'telemetry' | 'audit' | 'announcements' = 'inbox';
   threads: SpinVaultThread[] = [];
   selectedThread: SpinVaultThread | null = null;
   messages: SpinVaultMessage[] = [];
   reply = '';
+  searchQuery = '';
+  announcement: SpinVaultAnnouncement | null = null;
+  announcementDraft = '';
+  savingAnnouncement = false;
+  online = navigator.onLine;
+  otherTyping = false;
+  previewUrl: string | null = null;
+  imageZoom = 1;
   error = '';
   loadingInbox = true;
   sending = false;
@@ -249,8 +278,18 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
   private unsubscribeMessages: (() => void) | null = null;
   private unsubscribeAdminSignals: (() => void) | null = null;
   private telemetrySubscription: Subscription | null = null;
+  private typingChannel: { setTyping: (typing: boolean) => void; unsubscribe: () => void } | null = null;
+  private typingTimeout: ReturnType<typeof setTimeout> | null = null;
+  private typingBroadcastActive = false;
+  private otherTypingTimeout: ReturnType<typeof setTimeout> | null = null;
+  private imageFile: File | null = null;
+  private readonly onlineHandler = (): void => { this.online = true; };
+  private readonly offlineHandler = (): void => { this.online = false; };
 
-  constructor(private readonly spinVault: SpinVaultService) {}
+  constructor(private readonly spinVault: SpinVaultService) {
+    window.addEventListener('online', this.onlineHandler);
+    window.addEventListener('offline', this.offlineHandler);
+  }
 
   async ngOnInit(): Promise<void> {
     try {
@@ -265,6 +304,8 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
         void this.onLiveMessage(message);
       }, (message) => (this.error = message));
       this.paymentMethods = await this.spinVault.loadPaymentMethods(true);
+      this.announcement = await this.spinVault.loadPinnedAnnouncement();
+      this.announcementDraft = this.announcement?.body ?? '';
       await this.refreshAdminSignals();
       this.unsubscribeAdminSignals = this.spinVault.subscribeToAdminSignals(() => {
         void this.refreshAdminSignals();
@@ -282,6 +323,20 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
     this.unsubscribeMessages?.();
     this.unsubscribeAdminSignals?.();
     this.telemetrySubscription?.unsubscribe();
+    this.typingChannel?.unsubscribe();
+    this.clearTypingTimers();
+    this.clearPreview();
+    window.removeEventListener('online', this.onlineHandler);
+    window.removeEventListener('offline', this.offlineHandler);
+  }
+
+  get filteredMessages(): SpinVaultMessage[] {
+    const query = this.searchQuery.trim().toLowerCase();
+    if (!query) return this.messages;
+    return this.messages.filter((message) =>
+      [message.content, message.request_type ?? '', message.amount?.toString() ?? '', message.request_status ?? '']
+        .some((value) => value.toLowerCase().includes(query))
+    );
   }
 
   async openPlayers(): Promise<void> {
@@ -321,6 +376,45 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
       this.auditLogs = await this.spinVault.loadAuditLogs();
     } catch (error) {
       this.error = this.message(error);
+    }
+  }
+
+  async openAnnouncements(): Promise<void> {
+    this.activeTab = 'announcements';
+    try {
+      this.announcement = await this.spinVault.loadPinnedAnnouncement();
+      this.announcementDraft = this.announcement?.body ?? '';
+    } catch (error) {
+      this.error = this.message(error);
+    }
+  }
+
+  async saveAnnouncement(): Promise<void> {
+    this.savingAnnouncement = true;
+    this.error = '';
+    try {
+      await this.spinVault.setPinnedAnnouncement(this.announcementDraft);
+      this.announcement = await this.spinVault.loadPinnedAnnouncement();
+      this.notice = 'Announcement pinned for player chats.';
+    } catch (error) {
+      this.error = this.message(error);
+    } finally {
+      this.savingAnnouncement = false;
+    }
+  }
+
+  async clearAnnouncement(): Promise<void> {
+    this.savingAnnouncement = true;
+    this.error = '';
+    try {
+      await this.spinVault.clearPinnedAnnouncement();
+      this.announcement = null;
+      this.announcementDraft = '';
+      this.notice = 'Pinned announcement removed.';
+    } catch (error) {
+      this.error = this.message(error);
+    } finally {
+      this.savingAnnouncement = false;
     }
   }
 
@@ -406,9 +500,18 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
   }
 
   async openThread(thread: SpinVaultThread): Promise<void> {
+    this.typingChannel?.unsubscribe();
+    this.typingChannel = null;
+    this.clearTypingTimers();
     this.selectedThread = thread;
     this.messages = [];
+    this.searchQuery = '';
     this.error = '';
+    this.typingChannel = this.spinVault.subscribeToTyping(
+      thread.profile.id,
+      (typing) => this.setOtherTyping(typing),
+      (message) => this.error = message
+    );
     try {
       const messages = await this.spinVault.loadConversation(thread.profile.id);
       if (this.selectedThread?.profile.id === thread.profile.id) this.messages = messages;
@@ -419,40 +522,118 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
 
   async sendReply(): Promise<void> {
     const content = this.reply.trim();
-    if (!content || !this.selectedThread) return;
+    if (!content || !this.selectedThread || !this.online) return;
     this.sending = true;
     this.error = '';
+    const optimistic = this.optimisticMessage(content);
+    this.upsertMessage(optimistic);
     try {
       const message = await this.spinVault.sendMessage(this.selectedThread.profile.id, content);
+      this.messages = this.messages.filter((item) => item.id !== optimistic.id);
       this.upsertMessage(message);
       this.reply = '';
       await this.refreshInbox();
     } catch (error) {
+      this.messages = this.messages.map((item) =>
+        item.id === optimistic.id ? { ...item, delivery_status: 'failed' } : item
+      );
       this.error = this.message(error);
     } finally {
+      this.stopTyping();
       this.sending = false;
     }
   }
 
-  async sendImage(event: Event): Promise<void> {
+  async sendCannedReply(content: string): Promise<void> {
+    this.reply = content;
+    await this.sendReply();
+  }
+
+  selectImage(event: Event): void {
     const input = event.target;
-    if (!(input instanceof HTMLInputElement) || !input.files?.length || !this.selectedThread) return;
+    if (!(input instanceof HTMLInputElement) || !input.files?.length) return;
+    this.clearPreview();
+    this.imageFile = input.files[0];
+    this.previewUrl = URL.createObjectURL(this.imageFile);
+    this.imageZoom = 1;
+    input.value = '';
+  }
+
+  async uploadPreview(): Promise<void> {
+    if (!this.imageFile || !this.selectedThread || !this.online) return;
     this.uploading = true;
     this.error = '';
     try {
-      this.upsertMessage(await this.spinVault.uploadChatImage(this.selectedThread.profile.id, input.files[0]));
+      this.upsertMessage(await this.spinVault.uploadChatImage(this.selectedThread.profile.id, this.imageFile, this.imageZoom));
+      this.clearPreview();
     } catch (error) {
       this.error = this.message(error);
     } finally {
       this.uploading = false;
-      input.value = '';
     }
+  }
+
+  cancelImagePreview(): void { this.clearPreview(); }
+
+  onTyping(): void {
+    if (!this.typingChannel) return;
+    if (!this.typingBroadcastActive) {
+      this.typingChannel.setTyping(true);
+      this.typingBroadcastActive = true;
+    }
+    if (this.typingTimeout) clearTimeout(this.typingTimeout);
+    this.typingTimeout = setTimeout(() => this.stopTyping(), 1800);
+  }
+
+  private stopTyping(): void {
+    if (this.typingTimeout) clearTimeout(this.typingTimeout);
+    this.typingTimeout = null;
+    if (this.typingBroadcastActive) this.typingChannel?.setTyping(false);
+    this.typingBroadcastActive = false;
+  }
+
+  private clearTypingTimers(): void {
+    this.stopTyping();
+    if (this.otherTypingTimeout) clearTimeout(this.otherTypingTimeout);
+    this.otherTypingTimeout = null;
+  }
+
+  private setOtherTyping(typing: boolean): void {
+    this.otherTyping = typing;
+    if (this.otherTypingTimeout) clearTimeout(this.otherTypingTimeout);
+    this.otherTypingTimeout = typing ? setTimeout(() => this.otherTyping = false, 2500) : null;
+  }
+
+  private optimisticMessage(content: string): SpinVaultMessage {
+    const identity = this.identity;
+    const thread = this.selectedThread;
+    if (!identity || !thread) throw new Error('Select a player conversation before sending.');
+    return {
+      id: `pending-${crypto.randomUUID()}`,
+      sender_id: identity.id,
+      receiver_id: thread.profile.id,
+      content,
+      request_type: null,
+      amount: null,
+      request_status: null,
+      attachment_path: null,
+      attachment_name: null,
+      created_at: new Date().toISOString(),
+      delivery_status: 'pending'
+    };
+  }
+
+  private clearPreview(): void {
+    if (this.previewUrl) URL.revokeObjectURL(this.previewUrl);
+    this.previewUrl = null;
+    this.imageFile = null;
   }
 
   requestActionDisabled(message: SpinVaultMessage, action: RequestAction): boolean {
     if (this.processingRequestId === message.id || message.sender_id === this.identity?.id) return true;
     const status = message.request_status ?? 'pending';
-    if ((action === 'approve' || action === 'deny') && status !== 'pending') return true;
+    if ((action === 'approve' || action === 'deny') && status !== 'pending' && status !== 'verification_required') return true;
+    if (action === 'verification_required' && status !== 'pending' && status !== 'approved') return true;
     if (action === 'loaded' && (message.request_type !== 'load' || status !== 'approved')) return true;
     if (action === 'cashout_sent' && (message.request_type !== 'cashout' || status !== 'approved')) return true;
     return false;
@@ -460,6 +641,7 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
 
   async processRequest(message: SpinVaultMessage, action: RequestAction): Promise<void> {
     if (this.requestActionDisabled(message, action)) return;
+    if (!this.online) return;
     this.processingRequestId = message.id;
     this.error = '';
     try {

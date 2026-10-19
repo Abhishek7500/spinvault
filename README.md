@@ -12,6 +12,8 @@ Supabase-dependent functions work only after you configure a project and apply t
 - Sign in to SpinVault with admin-provisioned username/PIN credentials.
 - Use private player-to-admin chat, load/cash-out requests, and realtime updates.
 - Sign in to the admin dashboard at `/admin`.
+- Use a six-digit numeric keypad, optional separately stored recovery code, and a 15-minute inactivity lock.
+- Search chat history, see typing indicators and pinned notices, crop/compress image uploads, and use quick amount/game selections.
 
 There are **no default admin or player usernames/PINs**. Players sign in using a custom username and PIN; no player email address is required. Admin-provisioned accounts use the `username@spinvault.local` shadow-email format so the browser still receives a native Supabase session/JWT for RLS, Storage, and Realtime. An existing Supabase Auth player can be converted by resetting its access in the admin console.
 
@@ -27,6 +29,8 @@ Create a project in Supabase, open its SQL Editor, and run these scripts in orde
 2. [`supabase/spinvault-pin-auth.sql`](./supabase/spinvault-pin-auth.sql) adds username/PIN Auth, account administration, admin approvals, heartbeats, audit logs, and Super Admin telemetry.
 
 Both scripts are designed to be re-runnable. The PIN migration relies on the base profile trigger and must run after the base schema.
+
+If you already ran an earlier version of `spinvault-schema.sql`, run the current version again before applying the PIN migration. The current schema adds the `verification_required` request state used by the admin quick action.
 
 ### 2. Configure the Angular app
 
@@ -115,13 +119,27 @@ These are suggested account names, **not accounts or credentials that already ex
 
 An authenticated player can request admin elevation from the home navigation. Only a Super Admin can approve or reject that request in `/admin` → **Admin approvals**. To designate another trusted Super Admin, a current database owner must update the account using the Supabase SQL Editor; never expose that power through player-facing RPCs.
 
-### 6. Configure payment instructions and QR codes
+### 6. Deploy self-service PIN recovery
+
+Recovery uses a separate code that the player must enroll while signed in; it cannot recover accounts that have not set a recovery code. From the home page, a signed-in user opens **Recovery code**, saves a unique 8–32 character alphanumeric code, and stores it somewhere private. The code is hashed in `profiles` and is never retrievable by admins. The signed-out **Forgot your PIN?** link accepts this code and a new 6–32 character login PIN.
+
+Deploy the Supabase Edge Function after applying both SQL scripts:
+
+```bash
+supabase functions deploy recover-spinvault-pin --project-ref YOUR_PROJECT_REF
+```
+
+Configure `RECOVERY_IP_HASH_SECRET` as a high-entropy secret in Supabase **Project Settings → Edge Functions → Secrets**. The function also requires the project-provided `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`; if those are not present in your function environment, add them there from the project settings. Never place either server secret in Angular environment files, the README, or client code. The function configuration disables platform JWT verification for this public, signed-out recovery endpoint; the handler validates input and applies a three-attempt/15-minute limit keyed by username and a salted IP hash. The SQL recovery procedure updates the Auth password and PIN hash transactionally. Test it with a disposable account before production.
+
+The optional six-digit touch keypad accepts numeric-only PINs. The standard input continues to accept 6–32 alphanumeric PINs. After 15 minutes without pointer, keyboard, or touch activity, the app blurs and disables the current view and asks the user to sign in again with their login PIN. This is a privacy lock, not a replacement for device or browser security.
+
+### 7. Configure payment instructions and QR codes
 
 Sign in with the admin account and open `/admin` → **Payment methods**. Add a provider such as Cash App, Zelle, or Venmo, enter player-facing instructions, optionally select a QR image, and choose whether the option is visible to players. Existing options can be edited or hidden. QR codes are kept in a private Supabase Storage bucket and served to authorized users through signed URLs.
 
 The app does not connect to payment processors and does not move money. Admin actions record the request status and send a chat confirmation; verify and complete any payment separately using the provider's official service.
 
-### 7. Add game download links
+### 8. Add game download links
 
 In Supabase Table Editor, edit the rows in `public.games` and set `download_url` (and optionally `logo_url`) to URLs you are authorized to distribute. The app renders a download link only when `download_url` is populated; otherwise it offers a support prompt. The `Refresh list` button reloads the game list from Supabase.
 
@@ -145,6 +163,8 @@ Deploy the generated `dist/messenger-frontend/browser` directory to an Angular-c
 5. Populate a game's `download_url` and optionally `logo_url`, then refresh the game list to verify its compact tile and external link.
 6. As an admin, open a player's pending request, approve or deny it, then mark an approved load as loaded or an approved cash-out as sent. The status update and confirmation message are committed together by a database function.
 7. From either side of a conversation, attach a supported image (JPEG, PNG, WebP, or GIF, up to 5 MB) and check that the other participant can view it. Images and payment QR codes use private Storage buckets and row-level access policies.
+8. While chatting, confirm typing indicators, keyword/amount/request-type search, pinned announcements, offline messaging feedback, and quick amount/game request options. Image attachments are previewed, center-cropped, and compressed to JPEG before upload.
+9. Enroll a recovery code from a signed-in test account, sign out, and verify that the recovery page changes the login PIN. Confirm invalid attempts are rate limited; do not test recovery with your only owner account.
 
 The home, gallery, and How to play navigation work after static deployment. **Authentication, live game data, chat, request actions, payment instructions, and uploads require Supabase configuration and the current SQL schema.** A successful Angular build alone does not connect the app to Supabase. The referral banner is promotional copy only; it does not track referrals or issue a bonus.
 
@@ -152,7 +172,7 @@ The home, gallery, and How to play navigation work after static deployment. **Au
 
 The SQL schema gives unauthenticated visitors read access to the game list. Player PIN sign-in validates a bcrypt hash and then calls Supabase Auth `signInWithPassword` using the deterministic `username@spinvault.local` identifier; this second step is what creates the GoTrue JWT required by existing RLS, Storage, and Realtime policies. PIN validation is throttled at five failed attempts in a rolling ten-minute window per normalized username. PINs have a 6-character minimum; use a high-entropy alphanumeric PIN and never reuse a personal password.
 
-The migration explicitly withholds `pin_hash` and `last_ip` from client-readable profile columns. Super Admin telemetry is exposed through a role-checked RPC, and audit rows can only be read by admins. `last_ip` is included for future trusted server-side capture; the browser heartbeat does not accept a client-supplied IP as trustworthy. The SQL scripts have not been executed against your live project; apply them to a test Supabase project first, then validate role policies, shadow-email sign-in, account reset, failed-login lockout, Realtime, and storage with separate accounts. Configure backups, Auth security, and log retention before production.
+The migration explicitly withholds `pin_hash` and `last_ip` from client-readable profile columns. Super Admin telemetry is exposed through a role-checked RPC, and audit rows can only be read by admins. `last_ip` is included for future trusted server-side capture; the browser heartbeat does not accept a client-supplied IP as trustworthy. The SQL scripts and Edge Function have not been executed against your live project; apply them to a test Supabase project first, deploy the recovery function, then validate role policies, shadow-email sign-in, account reset, failed-login lockout, recovery-code throttling, Realtime, and storage with separate accounts. Configure backups, Auth security, and log retention before production.
 
 ## Run locally
 

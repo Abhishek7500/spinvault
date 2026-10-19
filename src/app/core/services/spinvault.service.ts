@@ -3,6 +3,17 @@ import { BehaviorSubject, interval, Subscription } from 'rxjs';
 import { createClient, RealtimeChannel, SupabaseClient, User } from '@supabase/supabase-js';
 import { environment } from '../../../environments/environment';
 
+export class PinAuthError extends Error {
+  constructor(
+    message: string,
+    readonly remainingAttempts: number,
+    readonly retryAfterSeconds: number
+  ) {
+    super(message);
+    this.name = 'PinAuthError';
+  }
+}
+
 export interface SpinVaultProfile {
   id: string;
   username: string;
@@ -32,11 +43,12 @@ export interface SpinVaultMessage {
   content: string;
   request_type: 'load' | 'cashout' | null;
   amount: number | null;
-  request_status: 'pending' | 'approved' | 'denied' | 'loaded' | 'cashout_sent' | null;
+  request_status: 'pending' | 'approved' | 'denied' | 'loaded' | 'cashout_sent' | 'verification_required' | null;
   attachment_path: string | null;
   attachment_name: string | null;
   attachment_url?: string | null;
   created_at: string;
+  delivery_status?: 'pending' | 'sent' | 'failed';
 }
 
 export interface SpinVaultPaymentMethod {
@@ -61,6 +73,13 @@ export interface SpinVaultAuditLog {
   event_type: 'login_failed' | 'system_error';
   error_message: string;
   created_at: string;
+}
+
+export interface SpinVaultAnnouncement {
+  id: boolean;
+  body: string;
+  updated_by: string;
+  updated_at: string;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -114,21 +133,125 @@ export class SpinVaultService {
     if (!/^[a-zA-Z0-9]{6,32}$/.test(pin)) {
       throw new Error('PINs must contain 6-32 letters or numbers.');
     }
-    const { data: isValid, error: validationError } = await this.client.rpc('login_with_pin', {
+    const { data: validationData, error: validationError } = await this.client.rpc('login_with_pin', {
       p_username: normalizedUsername,
       p_pin: pin
     });
     if (validationError) throw validationError;
-    if (isValid !== true) throw new Error('Incorrect username or PIN. Ask an admin for help if needed.');
+    const authResult = validationData as {
+      success: boolean;
+      remaining_attempts: number;
+      retry_after_seconds: number;
+    };
+    if (!authResult.success) {
+      const detail = authResult.retry_after_seconds > 0
+        ? `Too many failed attempts. Try again in ${Math.ceil(authResult.retry_after_seconds / 60)} minute(s).`
+        : `Incorrect username or PIN. ${authResult.remaining_attempts} attempt(s) remaining before a 10-minute lockout.`;
+      throw new PinAuthError(detail, authResult.remaining_attempts, authResult.retry_after_seconds);
+    }
 
-    const { data, error } = await this.client.auth.signInWithPassword({
+    const { data: authData, error } = await this.client.auth.signInWithPassword({
       email: `${normalizedUsername}@spinvault.local`,
       password: pin
     });
     if (error) throw error;
-    if (!data.user) throw new Error('Sign-in succeeded without a user account.');
-    await this.loadProfile(data.user);
+    if (!authData.user) throw new Error('Sign-in succeeded without a user account.');
+    await this.loadProfile(authData.user);
     this.startHeartbeat();
+  }
+
+  async recoverLoginPin(username: string, recoveryPin: string, newPin: string): Promise<void> {
+    const { error } = await this.client.functions.invoke('recover-spinvault-pin', {
+      body: { username, recoveryPin, newPin }
+    });
+    if (error) throw error;
+  }
+
+  async setRecoveryPin(recoveryPin: string): Promise<void> {
+    this.requireIdentity();
+    const { error } = await this.client.rpc('set_recovery_pin', {
+      p_recovery_pin: recoveryPin
+    });
+    if (error) throw error;
+  }
+
+  async setPinnedAnnouncement(body: string): Promise<void> {
+    const identity = this.requireAdmin();
+    const value = body.trim();
+    if (!value || value.length > 500) throw new Error('Announcement must be 1–500 characters.');
+    const { error } = await this.client.from('spinvault_announcements').upsert({
+      id: true,
+      body: value,
+      updated_by: identity.id,
+      updated_at: new Date().toISOString()
+    });
+    if (error) throw error;
+  }
+
+  async clearPinnedAnnouncement(): Promise<void> {
+    this.requireAdmin();
+    const { error } = await this.client.from('spinvault_announcements').delete().eq('id', true);
+    if (error) throw error;
+  }
+
+  async loadPinnedAnnouncement(): Promise<SpinVaultAnnouncement | null> {
+    this.requireIdentity();
+    const { data, error } = await this.client
+      .from('spinvault_announcements')
+      .select('id,body,updated_by,updated_at')
+      .eq('id', true)
+      .maybeSingle();
+    if (error) throw error;
+    return data as SpinVaultAnnouncement | null;
+  }
+
+  subscribeToPinnedAnnouncement(
+    onAnnouncement: (announcement: SpinVaultAnnouncement | null) => void,
+    onError: (message: string) => void
+  ): () => void {
+    this.requireIdentity();
+    const channel = this.client
+      .channel('spinvault-pinned-announcement')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'spinvault_announcements' }, (payload) => {
+        onAnnouncement(payload.eventType === 'DELETE' ? null : payload.new as SpinVaultAnnouncement);
+      })
+      .subscribe((status, error) => {
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          onError(error?.message ?? 'Could not reconnect to pinned chat announcements.');
+        }
+      });
+    return () => { void this.client.removeChannel(channel); };
+  }
+
+  subscribeToTyping(
+    otherUserId: string,
+    onTyping: (typing: boolean) => void,
+    onError: (message: string) => void
+  ): { setTyping: (typing: boolean) => void; unsubscribe: () => void } {
+    const identity = this.requireIdentity();
+    const participantIds = [identity.id, otherUserId].sort();
+    const channel = this.client
+      .channel(`spinvault-typing-${participantIds.join('-')}`)
+      .on('broadcast', { event: 'typing' }, ({ payload }) => {
+        if (payload['user_id'] === otherUserId && typeof payload['typing'] === 'boolean') {
+          onTyping(payload['typing']);
+        }
+      })
+      .subscribe((status, error) => {
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          onError(error?.message ?? 'Typing indicators are temporarily unavailable.');
+        }
+      });
+    return {
+      setTyping: (typing: boolean) => {
+        void channel.send({
+          type: 'broadcast',
+          event: 'typing',
+          payload: { user_id: identity.id, typing }
+        });
+      },
+      unsubscribe: () => { void this.client.removeChannel(channel); }
+    };
   }
 
   async signUp(email: string, username: string, password: string): Promise<boolean> {
@@ -333,7 +456,7 @@ export class SpinVaultService {
 
   async processRequest(
     messageId: string,
-    action: 'approve' | 'deny' | 'loaded' | 'cashout_sent'
+    action: 'approve' | 'deny' | 'loaded' | 'cashout_sent' | 'verification_required'
   ): Promise<SpinVaultMessage> {
     const { data, error } = await this.client.rpc('process_spinvault_request', {
       request_id: messageId,
@@ -344,20 +467,21 @@ export class SpinVaultService {
     return result.request;
   }
 
-  async uploadChatImage(receiverId: string, file: File): Promise<SpinVaultMessage> {
+  async uploadChatImage(receiverId: string, file: File, zoom = 1): Promise<SpinVaultMessage> {
     this.validateImage(file);
     const identity = this.requireIdentity();
-    const extension = file.type.split('/')[1]?.replace('jpeg', 'jpg') ?? 'img';
+    const compressedFile = await this.cropAndCompressImage(file, zoom);
+    const extension = 'jpg';
     const path = `${identity.id}/${crypto.randomUUID()}.${extension}`;
     const { error: uploadError } = await this.client.storage
       .from('chat-attachments')
-      .upload(path, file, { contentType: file.type, upsert: false });
+      .upload(path, compressedFile, { contentType: compressedFile.type, upsert: false });
     if (uploadError) throw uploadError;
     let message: SpinVaultMessage;
     try {
       message = await this.sendMessage(receiverId, 'Shared an image', null, null, {
         path,
-        name: file.name
+        name: file.name.replace(/\.[^.]+$/, '') + '.jpg'
       });
     } catch (error) {
       const { error: cleanupError } = await this.client.storage.from('chat-attachments').remove([path]);
@@ -368,6 +492,33 @@ export class SpinVaultService {
       throw error;
     }
     return this.resolveMessageAttachment(message);
+  }
+
+  private async cropAndCompressImage(file: File, zoom: number): Promise<File> {
+    const bitmap = await createImageBitmap(file);
+    try {
+      const boundedZoom = Math.min(1.5, Math.max(1, zoom));
+      const cropSize = Math.min(bitmap.width, bitmap.height) / boundedZoom;
+      const sourceX = (bitmap.width - cropSize) / 2;
+      const sourceY = (bitmap.height - cropSize) / 2;
+      const outputSize = Math.min(1600, Math.round(cropSize));
+      const canvas = document.createElement('canvas');
+      canvas.width = outputSize;
+      canvas.height = outputSize;
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Your browser could not prepare this image for upload.');
+      context.drawImage(bitmap, sourceX, sourceY, cropSize, cropSize, 0, 0, outputSize, outputSize);
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(
+          (result) => result ? resolve(result) : reject(new Error('Your image could not be compressed.')),
+          'image/jpeg',
+          0.82
+        );
+      });
+      return new File([blob], `${file.name.replace(/\.[^.]+$/, '')}.jpg`, { type: 'image/jpeg' });
+    } finally {
+      bitmap.close();
+    }
   }
 
   async loadPaymentMethods(adminView = false): Promise<SpinVaultPaymentMethod[]> {

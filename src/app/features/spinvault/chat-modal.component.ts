@@ -5,6 +5,7 @@ import { Router, RouterLink } from '@angular/router';
 import { Subscription } from 'rxjs';
 import {
   SpinVaultIdentity,
+  SpinVaultGame,
   SpinVaultMessage,
   SpinVaultPaymentMethod,
   SpinVaultService
@@ -38,24 +39,31 @@ import {
             <div class="chat-state"><span class="state-icon">✦</span><h3>You’re signed in as an admin.</h3><p>Open the admin dashboard to manage player conversations.</p><a routerLink="/admin">Go to admin dashboard →</a></div>
           } @else {
             <div class="chat-body">
+              @if (announcement) { <aside class="pinned-announcement" role="status">📌 {{ announcement.body }}</aside> }
+              @if (!online) { <p class="network-banner" role="status">You’re offline. Messages will send when the connection returns.</p> }
               @if (error) { <p class="chat-error chat-inline-error" role="alert">{{ error }}</p> }
+              <label class="message-search">Search messages<input [(ngModel)]="searchQuery" name="messageSearch" placeholder="Keyword, amount, load, cash-out…" /></label>
               <div class="chat-messages" aria-live="polite">
                 @if (!messages.length && !busy) {
                   <div class="chat-empty"><span>✦</span><p>Hey {{ identity.username }}! What can we help you with?</p><small>Only you and our support team can see this chat.</small></div>
                 }
-                @for (message of messages; track message.id) {
+                @if (messages.length && !filteredMessages.length) { <p class="chat-loading">No messages match your search.</p> }
+                @for (message of filteredMessages; track message.id) {
                   <article class="message-row" [class.message-mine]="message.sender_id === identity.id">
                     <div class="message-bubble">
                       @if (message.request_type) { <span class="request-tag">{{ message.request_type === 'load' ? 'LOAD REQUEST' : 'CASH-OUT REQUEST' }}</span> }
                       <p>{{ message.content }}</p>
                       @if (message.attachment_url) { <a class="chat-image-link" [href]="message.attachment_url" target="_blank" rel="noopener noreferrer"><img class="chat-image" [src]="message.attachment_url" [alt]="message.attachment_name || 'Chat image'" loading="lazy" /></a> }
                       @if (message.request_status) { <span class="request-status">Status: {{ message.request_status.replace('_', ' ') }}</span> }
+                      @if (message.delivery_status === 'pending') { <span class="request-status">Sending…</span> }
+                      @if (message.delivery_status === 'failed') { <span class="request-status delivery-failed">Not sent · try again</span> }
                       <time>{{ message.created_at | date:'shortTime' }}</time>
                     </div>
                   </article>
                 }
                 @if (busy && !messages.length) { <p class="chat-loading">Connecting to your private chat…</p> }
               </div>
+              @if (otherTyping) { <p class="typing-indicator">SpinVault support is typing<span>…</span></p> }
               <div class="quick-actions">
                 <button type="button" [class.selected]="requestType === 'load'" (click)="toggleRequest('load')">＋ Request load</button>
                 <button type="button" [class.selected]="requestType === 'cashout'" (click)="toggleRequest('cashout')">↗ Request cash-out</button>
@@ -73,14 +81,23 @@ import {
               }
               @if (requestType) {
                 <form class="request-form" (ngSubmit)="sendRequest()">
+                  <div class="amount-presets" aria-label="Suggested amounts">
+                    @for (amount of amountPresets; track amount) { <button type="button" [class.selected]="requestAmount === amount.toString()" (click)="requestAmount = amount.toString()">&#36;{{ amount }}</button> }
+                  </div>
+                  @if (games.length) {
+                    <label class="game-select">Game (optional)<select name="requestGame" [(ngModel)]="selectedGameId"><option value="">Choose a game</option>@for (game of games; track game.id) { <option [value]="game.id">{{ game.title }}</option> }</select></label>
+                  }
                   <label>Amount ($)<input name="amount" [(ngModel)]="requestAmount" inputmode="decimal" type="number" min="0.01" step="0.01" /></label>
-                  <button type="submit" [disabled]="busy">Send {{ requestType === 'load' ? 'load' : 'cash-out' }} request</button>
+                  <button type="submit" [disabled]="busy || !online">Send {{ requestType === 'load' ? 'load' : 'cash-out' }} request</button>
                 </form>
               } @else {
+                @if (previewUrl) {
+                  <div class="image-preview"><img [src]="previewUrl" alt="Selected image preview" [style.transform]="'scale(' + imageZoom + ')'" /><label>Crop zoom <input type="range" min="1" max="1.5" step="0.05" [(ngModel)]="imageZoom" name="imageZoom" /></label><button type="button" (click)="cancelImagePreview()">Remove</button><button type="button" [disabled]="uploading || !online" (click)="uploadPreview()">{{ uploading ? 'Uploading…' : 'Send image' }}</button></div>
+                }
                 <form class="chat-composer" (ngSubmit)="sendText()">
-                  <input name="draft" [(ngModel)]="draft" placeholder="Write a message…" aria-label="Write a message" autocomplete="off" />
+                  <input name="draft" [(ngModel)]="draft" (input)="onTyping()" placeholder="Write a message…" aria-label="Write a message" autocomplete="off" />
                   <label class="chat-image-button" [class.uploading]="uploading" title="Attach an image">
-                    <input type="file" accept="image/jpeg,image/png,image/webp,image/gif" (change)="sendImage($event)" [disabled]="busy || uploading" />
+                    <input type="file" accept="image/jpeg,image/png,image/webp,image/gif" (change)="selectImage($event)" [disabled]="busy || uploading" />
                     {{ uploading ? '…' : '▧' }}
                   </label>
                   <button type="submit" [disabled]="busy || !draft.trim()" aria-label="Send message">↑</button>
@@ -107,7 +124,8 @@ import {
     .chat-composer{display:flex;gap:8px;padding:7px;border:1px solid rgba(255,255,255,.1);border-radius:10px;background:#18192e}.chat-composer input{flex:1;min-width:0;border:0;outline:0;background:transparent;color:#fff;padding:0 5px;font:inherit;font-size:11px}.chat-composer input::placeholder{color:#77768c}.chat-composer button{height:33px;width:36px;border:0;border-radius:7px;background:#ff168b;color:white;font-size:17px;font-weight:800;cursor:pointer}.chat-composer button:disabled{opacity:.4}
     .chat-image-link{display:block;margin-top:7px}.chat-image{display:block;max-width:210px;max-height:180px;border-radius:7px;object-fit:contain}.chat-image-button{height:33px;width:34px;flex:none;display:grid;place-items:center;border:1px solid rgba(0,243,255,.16);border-radius:7px;color:#7cebf0;font-size:16px;cursor:pointer}.chat-image-button input{display:none}.chat-image-button.uploading{opacity:.55}
     .payment-details{flex:none;max-height:115px;overflow:auto;margin:0 0 9px;border:1px solid rgba(255,255,255,.075);border-radius:8px;background:rgba(255,255,255,.02)}.payment-details summary{display:flex;justify-content:space-between;padding:9px 10px;color:#00e1e9;font-size:9px;font-weight:700;cursor:pointer;list-style:none}.payment-details summary::-webkit-details-marker{display:none}.payment-option{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border-top:1px solid rgba(255,255,255,.06)}.payment-option strong{font-size:9px}.payment-option p{margin:4px 0 0;color:#9796aa;font-size:8px;white-space:pre-wrap}.payment-option img{width:42px;height:42px;border-radius:5px;object-fit:cover}
-    .request-form{display:flex;align-items:flex-end;gap:8px}.request-form label{flex:1;color:#aaa9bb;font-size:9px}.request-form input{height:37px;width:100%;margin-top:5px;padding:0 9px;border:1px solid rgba(255,255,255,.12);border-radius:7px;background:#18192e;color:#fff}.request-form button{height:37px;padding:0 10px;border:0;border-radius:7px;background:#ff168b;color:white;font-size:9px;font-weight:750;cursor:pointer}.request-form button:disabled{opacity:.5}
+    .request-form{display:flex;align-items:flex-end;gap:8px}.request-form label{flex:1;color:#aaa9bb;font-size:9px}.request-form input{height:37px;width:100%;margin-top:5px;padding:0 9px;border:1px solid rgba(255,255,255,.12);border-radius:7px;background:#18192e;color:#fff}.request-form button{height:37px;padding:0 10px;border:0;border-radius:7px;background:#ff168b;color:white;font-size:9px;font-weight:750;cursor:pointer}    .request-form button:disabled{opacity:.5}.pinned-announcement,.network-banner{flex:none;margin:9px 0 0;padding:8px 10px;border:1px solid rgba(0,243,255,.2);border-radius:7px;background:rgba(0,243,255,.06);color:#b4f9fa;font-size:9px;line-height:1.5}.network-banner{border-color:rgba(255,175,60,.28);background:rgba(255,175,60,.08);color:#ffd39b}.message-search{display:block;flex:none;margin-top:8px}.message-search input,.game-select select{width:100%;height:32px;padding:0 9px;border:1px solid rgba(255,255,255,.1);border-radius:7px;background:#18192e;color:#e9e8f3;font:inherit;font-size:9px}.typing-indicator{flex:none;margin:0 0 7px;color:#80e9ed;font-size:9px}.typing-indicator span{animation:typingPulse 1s infinite}@keyframes typingPulse{50%{opacity:.2}}.delivery-failed{color:#ff9cab}.amount-presets{display:flex;gap:5px;width:100%;margin:0 0 5px}.amount-presets button{flex:1;height:27px;border:1px solid rgba(0,243,255,.16);border-radius:6px;background:#18192e;color:#9ef1f3;font-size:9px}.amount-presets button.selected{border-color:#ff2c93;color:#ff8ac4}.game-select{flex:1;min-width:100%;color:#a3a2b4;font-size:9px}.request-form{flex-wrap:wrap}.image-preview{flex:none;display:grid;grid-template-columns:64px 1fr auto auto;align-items:center;gap:8px;margin:0 0 8px;padding:7px;border:1px solid rgba(0,243,255,.16);border-radius:8px;background:#18192e;overflow:hidden}.image-preview img{width:58px;height:48px;object-fit:cover;border-radius:5px}.image-preview label{color:#aaa9bb;font-size:8px}.image-preview label input{display:block;width:100%}.image-preview button{border:0;background:transparent;color:#8cecf0;font-size:8px;cursor:pointer}
+    .pinned-announcement,.network-banner{flex:none;margin:9px 0 0;padding:8px 10px;border:1px solid rgba(0,243,255,.2);border-radius:7px;background:rgba(0,243,255,.06);color:#b4f9fa;font-size:9px;line-height:1.5}.network-banner{border-color:rgba(255,175,60,.28);background:rgba(255,175,60,.08);color:#ffd39b}.message-search{display:block;flex:none;margin-top:8px}.message-search input,.game-select select{width:100%;height:32px;padding:0 9px;border:1px solid rgba(255,255,255,.1);border-radius:7px;background:#18192e;color:#e9e8f3;font:inherit;font-size:9px}.typing-indicator{flex:none;margin:0 0 7px;color:#80e9ed;font-size:9px}.typing-indicator span{animation:typingPulse 1s infinite}@keyframes typingPulse{50%{opacity:.2}}.delivery-failed{color:#ff9cab}.amount-presets{display:flex;gap:5px;width:100%;margin:0 0 5px}.amount-presets button{flex:1;height:27px;border:1px solid rgba(0,243,255,.16);border-radius:6px;background:#18192e;color:#9ef1f3;font-size:9px}.amount-presets button.selected{border-color:#ff2c93;color:#ff8ac4}.game-select{flex:1;min-width:100%;color:#a3a2b4;font-size:9px}.request-form{flex-wrap:wrap}.image-preview{flex:none;display:grid;grid-template-columns:64px 1fr auto auto;align-items:center;gap:8px;margin:0 0 8px;padding:7px;border:1px solid rgba(0,243,255,.16);border-radius:8px;background:#18192e}.image-preview img{width:58px;height:48px;object-fit:cover;border-radius:5px}.image-preview label{color:#aaa9bb;font-size:8px}.image-preview label input{display:block;width:100%}.image-preview button{border:0;background:transparent;color:#8cecf0;font-size:8px;cursor:pointer}
     @media(min-width:620px){.chat-backdrop{align-items:center;padding:20px}.chat-panel{height:min(700px,calc(100dvh - 40px));max-width:430px;border:1px solid rgba(0,243,255,.24);border-radius:18px}.chat-body{padding:0 17px 14px}.auth-content{padding:25px}}
   `]
 })
@@ -123,15 +141,34 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
   requestType: 'load' | 'cashout' | null = null;
   paymentMethods: SpinVaultPaymentMethod[] = [];
   messages: SpinVaultMessage[] = [];
+  games: SpinVaultGame[] = [];
+  announcement: { body: string } | null = null;
+  searchQuery = '';
+  selectedGameId = '';
+  readonly amountPresets = [25, 50, 100, 250];
+  imageZoom = 1;
+  previewUrl: string | null = null;
+  online = navigator.onLine;
+  otherTyping = false;
   error = '';
   busy = false;
   uploading = false;
+  private imageFile: File | null = null;
   private adminId: string | null = null;
   private chatStarted = false;
   private unsubscribeMessages: (() => void) | null = null;
+  private unsubscribeAnnouncement: (() => void) | null = null;
+  private typingChannel: { setTyping: (typing: boolean) => void; unsubscribe: () => void } | null = null;
+  private typingTimeout: ReturnType<typeof setTimeout> | null = null;
+  private typingBroadcastActive = false;
+  private otherTypingTimeout: ReturnType<typeof setTimeout> | null = null;
   private identitySubscription: Subscription;
+  private readonly onlineHandler = (): void => { this.online = true; };
+  private readonly offlineHandler = (): void => { this.online = false; };
 
   constructor(private readonly spinVault: SpinVaultService, private readonly router: Router) {
+    window.addEventListener('online', this.onlineHandler);
+    window.addEventListener('offline', this.offlineHandler);
     this.identitySubscription = this.spinVault.identity$.subscribe((identity) => {
       this.identity = identity;
       if (this.open && identity) void this.startChat();
@@ -151,7 +188,22 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
 
   ngOnDestroy(): void {
     this.unsubscribeMessages?.();
+    this.unsubscribeAnnouncement?.();
+    this.typingChannel?.unsubscribe();
+    this.clearTypingTimers();
+    this.clearPreview();
+    window.removeEventListener('online', this.onlineHandler);
+    window.removeEventListener('offline', this.offlineHandler);
     this.identitySubscription.unsubscribe();
+  }
+
+  get filteredMessages(): SpinVaultMessage[] {
+    const query = this.searchQuery.trim().toLowerCase();
+    if (!query) return this.messages;
+    return this.messages.filter((message) =>
+      [message.content, message.request_type ?? '', message.amount?.toString() ?? '', message.request_status ?? '']
+        .some((value) => value.toLowerCase().includes(query))
+    );
   }
 
   async submitAuth(): Promise<void> {
@@ -176,35 +228,50 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
 
   async sendText(): Promise<void> {
     const content = this.draft.trim();
-    if (!content || !this.adminId) return;
+    if (!content || !this.adminId || !this.online) return;
     this.busy = true;
     this.error = '';
+    const optimistic = this.optimisticMessage(content);
+    this.upsertMessage(optimistic);
     try {
       const message = await this.spinVault.sendMessage(this.adminId, content);
+      this.messages = this.messages.filter((item) => item.id !== optimistic.id);
       this.upsertMessage(message);
       this.draft = '';
     } catch (error) {
+      this.messages = this.messages.map((item) =>
+        item.id === optimistic.id ? { ...item, delivery_status: 'failed' } : item
+      );
       this.reportError(error);
     } finally {
+      this.stopTyping();
       this.busy = false;
     }
   }
 
   async sendRequest(): Promise<void> {
     const amount = Number(this.requestAmount);
-    if (!this.requestType || !this.adminId || !Number.isFinite(amount) || amount <= 0) {
+    if (!this.requestType || !this.adminId || !this.online || !Number.isFinite(amount) || amount <= 0) {
       this.error = 'Enter an amount greater than $0.';
       return;
     }
     const type = this.requestType;
-    const content = `${type === 'load' ? 'Load' : 'Cash-out'} request — $${amount.toFixed(2)}`;
+    const gameTitle = this.games.find((game) => game.id === this.selectedGameId)?.title;
+    const content = `${type === 'load' ? 'Load' : 'Cash-out'} request — $${amount.toFixed(2)}${gameTitle ? ` · ${gameTitle}` : ''}`;
     this.busy = true;
     this.error = '';
+    const optimistic = this.optimisticMessage(content, type, amount);
+    this.upsertMessage(optimistic);
     try {
       const message = await this.spinVault.sendMessage(this.adminId, content, type, amount);
+      this.messages = this.messages.filter((item) => item.id !== optimistic.id);
       this.upsertMessage(message);
       this.requestType = null;
+      this.selectedGameId = '';
     } catch (error) {
+      this.messages = this.messages.map((item) =>
+        item.id === optimistic.id ? { ...item, delivery_status: 'failed' } : item
+      );
       this.reportError(error);
     } finally {
       this.busy = false;
@@ -215,24 +282,89 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
     this.closed.emit();
   }
 
-  async sendImage(event: Event): Promise<void> {
+  selectImage(event: Event): void {
     const input = event.target;
-    if (!(input instanceof HTMLInputElement) || !input.files?.length || !this.adminId) return;
+    if (!(input instanceof HTMLInputElement) || !input.files?.length) return;
+    this.clearPreview();
+    this.imageFile = input.files[0];
+    this.previewUrl = URL.createObjectURL(this.imageFile);
+    this.imageZoom = 1;
+    input.value = '';
+  }
+
+  async uploadPreview(): Promise<void> {
+    if (!this.imageFile || !this.adminId || !this.online) return;
     this.uploading = true;
     this.error = '';
     try {
-      this.upsertMessage(await this.spinVault.uploadChatImage(this.adminId, input.files[0]));
+      this.upsertMessage(await this.spinVault.uploadChatImage(this.adminId, this.imageFile, this.imageZoom));
+      this.clearPreview();
     } catch (error) {
       this.reportError(error);
     } finally {
       this.uploading = false;
-      input.value = '';
     }
   }
 
+  cancelImagePreview(): void { this.clearPreview(); }
+
+  onTyping(): void {
+    if (!this.typingChannel) return;
+    if (!this.typingBroadcastActive) {
+      this.typingChannel.setTyping(true);
+      this.typingBroadcastActive = true;
+    }
+    if (this.typingTimeout) clearTimeout(this.typingTimeout);
+    this.typingTimeout = setTimeout(() => this.stopTyping(), 1800);
+  }
+
+  private stopTyping(): void {
+    if (this.typingTimeout) clearTimeout(this.typingTimeout);
+    this.typingTimeout = null;
+    if (this.typingBroadcastActive) this.typingChannel?.setTyping(false);
+    this.typingBroadcastActive = false;
+  }
+
+  private clearTypingTimers(): void {
+    this.stopTyping();
+    if (this.otherTypingTimeout) clearTimeout(this.otherTypingTimeout);
+    this.otherTypingTimeout = null;
+  }
+
+  private setOtherTyping(typing: boolean): void {
+    this.otherTyping = typing;
+    if (this.otherTypingTimeout) clearTimeout(this.otherTypingTimeout);
+    this.otherTypingTimeout = typing ? setTimeout(() => this.otherTyping = false, 2500) : null;
+  }
+
+  private optimisticMessage(content: string, type: 'load' | 'cashout' | null = null, amount: number | null = null): SpinVaultMessage {
+    const identity = this.identity;
+    if (!identity || !this.adminId) throw new Error('Your chat session is not ready.');
+    return {
+      id: `pending-${crypto.randomUUID()}`,
+      sender_id: identity.id,
+      receiver_id: this.adminId,
+      content,
+      request_type: type,
+      amount,
+      request_status: type ? 'pending' : null,
+      attachment_path: null,
+      attachment_name: null,
+      created_at: new Date().toISOString(),
+      delivery_status: 'pending'
+    };
+  }
+
+  private clearPreview(): void {
+    if (this.previewUrl) URL.revokeObjectURL(this.previewUrl);
+    this.previewUrl = null;
+    this.imageFile = null;
+  }
+
   private async startChat(): Promise<void> {
-    if (!this.identity || this.chatStarted) return;
-    if (this.identity.role === 'admin' || this.identity.is_super_admin) {
+    const identity = this.identity;
+    if (!identity || this.chatStarted) return;
+    if (identity.role === 'admin' || identity.is_super_admin) {
       this.close();
       void this.router.navigateByUrl('/admin');
       return;
@@ -245,6 +377,18 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
       this.adminId = admin.id;
       this.messages = await this.spinVault.loadConversation(admin.id);
       this.paymentMethods = await this.spinVault.loadPaymentMethods();
+      this.games = await this.spinVault.loadGames();
+      this.announcement = await this.spinVault.loadPinnedAnnouncement();
+      if (!this.open || this.identity?.id !== identity.id) return;
+      this.unsubscribeAnnouncement = this.spinVault.subscribeToPinnedAnnouncement(
+        (announcement) => this.announcement = announcement,
+        (message) => this.reportError(new Error(message))
+      );
+      this.typingChannel = this.spinVault.subscribeToTyping(
+        admin.id,
+        (typing) => this.setOtherTyping(typing),
+        (message) => this.reportError(new Error(message))
+      );
       this.unsubscribeMessages = this.spinVault.subscribeToMessages(async (message) => {
         if (
           (message.sender_id === admin.id && message.receiver_id === this.identity?.id) ||
@@ -275,11 +419,20 @@ export class ChatModalComponent implements OnChanges, OnDestroy {
 
   private resetChat(): void {
     this.unsubscribeMessages?.();
+    this.unsubscribeAnnouncement?.();
+    this.typingChannel?.unsubscribe();
+    this.unsubscribeAnnouncement = null;
+    this.typingChannel = null;
+    this.clearTypingTimers();
     this.unsubscribeMessages = null;
     this.adminId = null;
     this.chatStarted = false;
     this.messages = [];
     this.paymentMethods = [];
+    this.games = [];
+    this.announcement = null;
+    this.otherTyping = false;
+    this.clearPreview();
   }
 
   private message(error: unknown): string {
