@@ -1,72 +1,315 @@
-import { Component, OnDestroy } from '@angular/core';
-import { CommonModule } from '@angular/common';
+import { Component, OnDestroy, OnInit, inject } from '@angular/core';
+import { CommonModule, CurrencyPipe, DatePipe } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { RouterOutlet } from '@angular/router';
-import { Subscription } from 'rxjs';
-import { VaultSecurityService } from './core/services/vault-security.service';
+import QRCode from 'qrcode';
+import { Receipt, ReceiptService } from './core/services/receipt.service';
+import { analyzeSpend, buildDisputeEmail, getReturnWindowDays, makeReceiptQrPayload } from './core/receipt-tools';
+import { PriceDropTracker } from './core/price-drop-tracker';
+
+type View = 'tracker' | 'insights' | 'warranties' | 'profile';
+type Period = 'week' | 'month';
 
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [CommonModule, FormsModule, RouterOutlet],
-  template: `
-    <div class="vault-content" [class.vault-blurred]="security.isLocked" [attr.inert]="security.isLocked ? '' : null">
-      <router-outlet />
-    </div>
-    @if (security.isLocked) {
-      <div class="vault-lock-screen">
-        <section class="vault-lock-card" role="dialog" aria-modal="true" aria-labelledby="vault-lock-title">
-          <span class="vault-lock-icon">◆</span>
-          <p class="vault-lock-eyebrow">SESSION PAUSED</p>
-          <h1 id="vault-lock-title">Vault <em>locked</em></h1>
-          <p>For your privacy, this session locked after inactivity. Enter your login PIN to continue.</p>
-          @if (lockError) { <p class="vault-lock-error" role="alert">The session could not be signed out cleanly: {{ lockError }} Your screen remains locked.</p> }
-          <form (ngSubmit)="unlock()">
-            <label>Username<input [ngModel]="security.username" name="username" readonly autocomplete="username" /></label>
-            <label>Login PIN<input [(ngModel)]="pin" name="pin" type="password" inputmode="text" autocomplete="current-password" /></label>
-            @if (error) { <p class="vault-lock-error" role="alert">{{ error }}</p> }
-            <button type="submit" [disabled]="loading || pin.length < 6">{{ loading ? 'Unlocking…' : 'Unlock SpinVault' }}</button>
-          </form>
-        </section>
-      </div>
-    }
-  `,
-  styles: [`
-    :host{display:block;min-height:100vh}.vault-content{min-height:100vh;transition:filter .2s}.vault-blurred{filter:blur(12px);pointer-events:none;user-select:none}.vault-lock-screen{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;padding:20px;background:rgba(5,6,18,.78);backdrop-filter:blur(8px);font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:#f8f7ff}.vault-lock-card{width:min(100%,390px);padding:27px;border:1px solid rgba(0,243,255,.24);border-radius:16px;background:#111226;box-shadow:0 0 60px rgba(0,243,255,.1)}.vault-lock-icon{color:#00f3ff;font-size:25px}.vault-lock-eyebrow{margin:13px 0 6px;color:#00e2eb;font-size:9px;font-weight:800;letter-spacing:1.6px}.vault-lock-card h1{margin:0;font-size:28px}.vault-lock-card h1 em{color:#ff2c93;font-style:normal}.vault-lock-card>p:not(.vault-lock-eyebrow){color:#a3a2b4;font-size:11px;line-height:1.6}.vault-lock-card form{display:grid;gap:12px;margin-top:18px}.vault-lock-card label{display:grid;gap:6px;color:#dad9e4;font-size:10px;font-weight:700}.vault-lock-card input{height:40px;padding:0 11px;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:#101126;color:#fff;font:inherit}.vault-lock-card button{height:42px;border:0;border-radius:8px;background:linear-gradient(100deg,#ff007f,#bd21b2);color:#fff;font-weight:800}.vault-lock-card button:disabled{opacity:.5}.vault-lock-error{margin:0;color:#ff9cab;font-size:10px}
-  `]
+  imports: [CommonModule, FormsModule, CurrencyPipe, DatePipe],
+  templateUrl: './app.component.html',
+  styleUrl: './app.component.css'
 })
-export class AppComponent implements OnDestroy {
-  pin = '';
-  error = '';
-  loading = false;
-  lockError: string | null = null;
-  private readonly lockSubscription: Subscription;
-  private readonly lockErrorSubscription: Subscription;
+export class AppComponent implements OnInit, OnDestroy {
+  readonly receiptsApi = inject(ReceiptService);
+  private readonly priceDropTracker = new PriceDropTracker();
 
-  constructor(readonly security: VaultSecurityService) {
-    this.lockSubscription = security.locked$.subscribe(() => {
-      this.pin = '';
-      this.error = '';
-    });
-    this.lockErrorSubscription = security.lockError$.subscribe((message) => this.lockError = message);
+  readonly views: { id: View; label: string; icon: string }[] = [
+    { id: 'tracker', label: 'Tracker', icon: '▤' },
+    { id: 'insights', label: 'Insights', icon: '↗' },
+    { id: 'warranties', label: 'Warranties', icon: '⬡' },
+    { id: 'profile', label: 'Profile', icon: '◎' }
+  ];
+  activeView: View = 'tracker';
+  period: Period = 'week';
+  receipts: Receipt[] = [];
+  selectedReceipt: Receipt | null = null;
+  receiptQr = '';
+  loading = true;
+  scanning = false;
+  error = '';
+  success = '';
+  email = '';
+  emailSent = false;
+  customDeadline = '';
+  readonly today = new Date();
+  private pollingHandle: number | null = null;
+  private polling = false;
+
+  get totalSpend(): number {
+    return this.receipts.reduce((sum, receipt) => sum + receipt.total_amount, 0);
   }
 
-  async unlock(): Promise<void> {
-    if (this.loading || this.pin.length < 6) return;
+  get refundTotal(): number {
+    return this.receipts.reduce((sum, receipt) => {
+      const returnWindowOpen = receipt.status === 'active' && receipt.return_deadline !== null &&
+        new Date(`${receipt.return_deadline}T23:59:59`) >= this.today;
+      if (!returnWindowOpen) return sum;
+      return sum + receipt.items.reduce((itemSum, item) => {
+        const alert = item.price_alert;
+        return itemSum + (alert?.status === 'active' ? Math.max(alert.original_price - alert.lowest_found_price, 0) * item.quantity : 0);
+      }, 0);
+    }, 0);
+  }
+
+  get maxCategorySpend(): number {
+    return Math.max(...this.spendSummary.map((entry) => entry.current), 1);
+  }
+
+  get currentPeriodSpend(): number {
+    return this.spendSummary.reduce((sum, entry) => sum + entry.current, 0);
+  }
+
+  get activeReturns(): Receipt[] {
+    return this.receipts.filter((receipt) => receipt.return_deadline && new Date(`${receipt.return_deadline}T23:59:59`) >= this.today);
+  }
+
+  get activeWarranties(): Receipt[] {
+    return this.receipts.filter((receipt) => receipt.warranty_expiration && new Date(`${receipt.warranty_expiration}T23:59:59`) >= this.today);
+  }
+
+  get spendSummary() {
+    return analyzeSpend(this.receipts, this.period);
+  }
+
+  get alias(): string {
+    return this.receiptsApi.profile?.unique_email_alias ?? 'Sign in to generate your alias';
+  }
+
+  get isSignedIn(): boolean {
+    return Boolean(this.receiptsApi.profile);
+  }
+
+  ngOnInit(): void {
+    void this.loadReceipts();
+    this.pollingHandle = window.setInterval(() => {
+      if (this.receiptsApi.user && !this.polling && !this.loading) {
+        void this.pollPriceDrops().catch((error: unknown) => {
+          this.error = this.errorMessage(error);
+        });
+      }
+    }, 6 * 60 * 60 * 1000);
+  }
+
+  ngOnDestroy(): void {
+    if (this.pollingHandle !== null) window.clearInterval(this.pollingHandle);
+  }
+
+  async loadReceipts(): Promise<void> {
     this.loading = true;
     this.error = '';
     try {
-      await this.security.unlock(this.pin);
-      this.pin = '';
+      this.receipts = await this.receiptsApi.loadReceipts();
+      if (this.receiptsApi.user) {
+        await this.pollPriceDrops();
+      }
     } catch (error) {
-      this.error = error instanceof Error ? error.message : 'Unable to unlock this session.';
+      this.error = this.errorMessage(error);
     } finally {
       this.loading = false;
     }
   }
 
-  ngOnDestroy(): void {
-    this.lockSubscription.unsubscribe();
-    this.lockErrorSubscription.unsubscribe();
+  setView(view: View): void {
+    this.activeView = view;
+    this.success = '';
+  }
+
+  sortLatest(): void {
+    this.receipts = this.receipts.slice().sort((left, right) =>
+      right.purchase_date.localeCompare(left.purchase_date)
+    );
+  }
+
+  openCamera(input: HTMLInputElement): void {
+    input.click();
+  }
+
+  async onImageSelected(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const image = input.files?.[0];
+    if (!image) return;
+    input.value = '';
+    if (!this.isSignedIn) {
+      this.error = 'Sign in from Profile before scanning and saving receipts.';
+      this.activeView = 'profile';
+      return;
+    }
+    if (!image.type.startsWith('image/')) {
+      this.error = 'Choose a receipt photo in an image format.';
+      return;
+    }
+    this.scanning = true;
+    this.error = '';
+    this.success = '';
+    try {
+      const scanned = await this.receiptsApi.scanReceipt(image);
+      this.receipts = [scanned, ...this.receipts];
+      this.selectedReceipt = scanned;
+      this.customDeadline = scanned.return_deadline ?? '';
+      this.success = 'Receipt scanned and saved. Check the return and warranty dates below.';
+      await this.refreshQr(scanned);
+      await this.pollPriceDrops();
+    } catch (error) {
+      this.error = this.errorMessage(error);
+    } finally {
+      this.scanning = false;
+    }
+  }
+
+  async selectReceipt(receipt: Receipt): Promise<void> {
+    this.selectedReceipt = receipt;
+    this.customDeadline = receipt.return_deadline ?? '';
+    this.error = '';
+    await this.refreshQr(receipt);
+  }
+
+  closeReceipt(): void {
+    this.selectedReceipt = null;
+    this.receiptQr = '';
+  }
+
+  async saveCustomWindow(): Promise<void> {
+    const receipt = this.selectedReceipt;
+    if (!receipt || !this.customDeadline) {
+      this.error = 'Choose a return deadline on the calendar.';
+      return;
+    }
+    const days = Math.round((new Date(`${this.customDeadline}T12:00:00`).getTime() - new Date(`${receipt.purchase_date}T12:00:00`).getTime()) / 86_400_000);
+    if (!Number.isInteger(days) || days < 0 || days > 3650) {
+      this.error = 'Choose a date on or after the purchase date, within 10 years.';
+      return;
+    }
+    try {
+      const updated = await this.receiptsApi.updateReturnWindow(receipt.id, days, receipt.purchase_date);
+      this.receipts = this.receipts.map((item) => item.id === updated.id ? updated : item);
+      this.selectedReceipt = updated;
+      this.customDeadline = updated.return_deadline ?? '';
+      await this.refreshQr(updated);
+      this.success = 'Custom return window saved.';
+      this.error = '';
+    } catch (error) {
+      this.error = this.errorMessage(error);
+    }
+  }
+
+  async signIn(): Promise<void> {
+    this.error = '';
+    this.success = '';
+    try {
+      await this.receiptsApi.sendSignInLink(this.email);
+      this.emailSent = true;
+    } catch (error) {
+      this.error = this.errorMessage(error);
+    }
+  }
+
+  async signOut(): Promise<void> {
+    try {
+      await this.receiptsApi.signOut();
+      this.receipts = [];
+      this.selectedReceipt = null;
+      this.emailSent = false;
+      this.success = 'You have been signed out.';
+    } catch (error) {
+      this.error = this.errorMessage(error);
+    }
+  }
+
+  async copyAlias(): Promise<void> {
+    if (!this.isSignedIn) return;
+    try {
+      await navigator.clipboard.writeText(this.alias);
+      this.success = 'Email alias copied.';
+    } catch (error) {
+      this.error = `Could not copy the alias: ${this.errorMessage(error)}`;
+    }
+  }
+
+  async packageDispute(receipt: Receipt): Promise<void> {
+    const message = buildDisputeEmail(receipt);
+    try {
+      await navigator.clipboard.writeText(message.body);
+      this.success = 'Dispute evidence copied. Your email draft is ready to open.';
+    } catch (error) {
+      this.error = `Could not copy dispute evidence: ${this.errorMessage(error)}`;
+    }
+    window.location.href = `mailto:?subject=${encodeURIComponent(message.subject)}&body=${encodeURIComponent(message.body)}`;
+  }
+
+  getReturnDays(receipt: Receipt): number | null {
+    if (!receipt.return_deadline) return null;
+    return this.calendarDaysUntil(receipt.return_deadline);
+  }
+
+  getWarrantyDays(receipt: Receipt): number | null {
+    if (!receipt.warranty_expiration) return null;
+    return this.calendarDaysUntil(receipt.warranty_expiration);
+  }
+
+  retailerWindow(receipt: Receipt): number | null {
+    return getReturnWindowDays(receipt.store_name);
+  }
+
+  categoryIcon(category: string): string {
+    const key = category.toLowerCase();
+    if (key.includes('elect')) return '⌘';
+    if (key.includes('groc')) return '◒';
+    if (key.includes('cloth') || key.includes('apparel')) return '✳';
+    if (key.includes('home')) return '⌂';
+    return '✦';
+  }
+
+  categoryColor(index: number): string {
+    return ['#9df0c6', '#d2b7ff', '#ffd29e', '#f4a8ba', '#9eddf4'][index % 5];
+  }
+
+  private async refreshQr(receipt: Receipt): Promise<void> {
+    try {
+      this.receiptQr = await QRCode.toDataURL(JSON.stringify(makeReceiptQrPayload(receipt)), {
+        errorCorrectionLevel: 'M',
+        margin: 1,
+        width: 220,
+        color: { dark: '#17221d', light: '#ffffff' }
+      });
+    } catch (error) {
+      this.receiptQr = '';
+      this.error = `Could not create the return pass QR code: ${this.errorMessage(error)}`;
+    }
+  }
+
+  private async pollPriceDrops(): Promise<void> {
+    if (this.polling) return;
+    const alerts = this.priceDropTracker.check(this.receipts);
+    if (alerts.length === 0) return;
+    this.polling = true;
+    try {
+      const updates = await this.receiptsApi.savePriceAlerts(alerts);
+      this.receipts = this.receipts.map((receipt) => ({
+        ...receipt,
+        items: receipt.items.map((item) => {
+          const alert = updates.find((entry) => entry.receipt_item_id === item.id);
+          return alert ? { ...item, price_alert: alert } : item;
+        })
+      }));
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  private errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : 'Something went wrong. Please try again.';
+  }
+
+  private calendarDaysUntil(date: string): number {
+    const deadline = new Date(`${date}T12:00:00`);
+    const today = new Date(this.today.getFullYear(), this.today.getMonth(), this.today.getDate(), 12);
+    return Math.max(Math.round((deadline.getTime() - today.getTime()) / 86_400_000), 0);
   }
 }

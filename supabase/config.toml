@@ -1,2 +1,5 @@
-[functions.recover-spinvault-pin]
+[functions.scan-receipt]
+verify_jwt = true
+
+[functions.inbound-email]
 verify_jwt = false

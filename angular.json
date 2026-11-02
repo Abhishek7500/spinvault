@@ -3,7 +3,7 @@
   "version": 1,
   "newProjectRoot": "projects",
   "projects": {
-    "messenger-frontend": {
+    "smartreceipt": {
       "projectType": "application",
       "root": "",
       "sourceRoot": "src",
@@ -12,7 +12,7 @@
         "build": {
           "builder": "@angular-devkit/build-angular:application",
           "options": {
-            "outputPath": "dist/messenger-frontend",
+            "outputPath": "dist/smartreceipt",
             "index": "src/index.html",
             "browser": "src/main.ts",
             "polyfills": ["zone.js"],
@@ -27,7 +27,7 @@
             ],
             "styles": ["src/styles.css"],
             "scripts": [],
-            "allowedCommonJsDependencies": ["sockjs-client"]
+            "allowedCommonJsDependencies": ["qrcode"]
           },
           "configurations": {
             "production": {
@@ -59,10 +59,10 @@
           "builder": "@angular-devkit/build-angular:dev-server",
           "configurations": {
             "production": {
-              "buildTarget": "messenger-frontend:build:production"
+              "buildTarget": "smartreceipt:build:production"
             },
             "development": {
-              "buildTarget": "messenger-frontend:build:development"
+              "buildTarget": "smartreceipt:build:development"
             }
           },
           "defaultConfiguration": "development"

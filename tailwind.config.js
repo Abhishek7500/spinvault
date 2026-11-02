@@ -4,13 +4,13 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        messenger: {
-          blue: "#0084FF",
-          "blue-dark": "#006FD6",
-          ink: "#050505",
-          muted: "#65676B",
-          wash: "#F0F2F5",
-          bubble: "#E4E6EB"
+        receipt: {
+          forest: "#1A3C2B",
+          leaf: "#5D9D73",
+          mint: "#E9F4E7",
+          canvas: "#F6F7F3",
+          ink: "#18251F",
+          muted: "#7A877D"
         }
       },
       boxShadow: {

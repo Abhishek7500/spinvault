@@ -1,0 +1,239 @@
+<div class="app-shell min-h-screen bg-receipt-canvas text-receipt-ink">
+  <header class="topbar">
+    <a class="brand" href="#" (click)="setView('tracker'); $event.preventDefault()" aria-label="SmartReceipt home">
+      <span class="brand-mark">s<span>r</span></span>
+      <span>smartreceipt<span class="brand-period">.</span></span>
+    </a>
+    <div class="topbar-right">
+      @if (isSignedIn) {
+        <span class="sync-state"><span class="sync-dot"></span> Synced</span>
+      } @else {
+        <span class="demo-state">Preview mode</span>
+      }
+      <button class="avatar-button" type="button" aria-label="Open profile" (click)="setView('profile')">
+        {{ isSignedIn ? (receiptsApi.profile?.email?.slice(0, 1) ?? 'Y').toUpperCase() : 'Y' }}
+      </button>
+    </div>
+  </header>
+
+  <main class="main-content">
+    @if (error) {
+      <div class="notice notice-error" role="alert">
+        <span>{{ error }}</span><button type="button" (click)="error = ''" aria-label="Dismiss error">×</button>
+      </div>
+    }
+    @if (success) {
+      <div class="notice notice-success" role="status">
+        <span>{{ success }}</span><button type="button" (click)="success = ''" aria-label="Dismiss message">×</button>
+      </div>
+    }
+
+    @if (activeView === 'tracker') {
+      <section class="view-panel rise-in">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">{{ today | date:'EEEE, MMMM d' }}</p>
+            <h1>Your purchases,<br class="mobile-break"> in good hands.</h1>
+            <p class="heading-copy">Every receipt, return and warranty — right where you need it.</p>
+          </div>
+          <div class="spend-chip"><span class="chip-icon">↗</span><span><small>Tracked purchases</small><strong>{{ totalSpend | currency:'USD':'symbol':'1.0-0' }}</strong></span></div>
+        </div>
+
+        <button class="scan-card" type="button" [disabled]="scanning" (click)="openCamera(receiptInput)">
+          <span class="scan-icon">{{ scanning ? '◌' : '＋' }}</span>
+          <span class="scan-copy">
+            <strong>{{ scanning ? 'Reading your receipt…' : 'Scan a receipt' }}</strong>
+            <small>{{ scanning ? 'AI is finding the store, date and items' : 'Snap a photo. We’ll take it from here.' }}</small>
+          </span>
+          <span class="scan-arrow">↗</span>
+        </button>
+        <input #receiptInput class="visually-hidden" type="file" accept="image/*" capture="environment" aria-label="Choose a receipt photo" (change)="onImageSelected($event)">
+
+        @if (refundTotal > 0) {
+          <div class="refund-banner">
+            <span class="refund-icon">↓</span>
+            <div><small>PRICE MATCH OPPORTUNITY</small><strong>{{ refundTotal | currency:'USD' }} potentially back in your pocket</strong></div>
+            <span class="refund-arrow">↗</span>
+          </div>
+        }
+
+        <div class="section-heading">
+          <div><p class="eyebrow">YOUR RECEIPTS</p><h2>Returns to watch <span class="count-pill">{{ activeReturns.length }}</span></h2></div>
+          <button class="text-button" type="button" (click)="sortLatest()">Latest first <span>⌄</span></button>
+        </div>
+
+        @if (loading) {
+          <div class="loading-card"><span class="loading-spinner"></span> Getting your receipts ready…</div>
+        } @else if (activeReturns.length === 0) {
+          <div class="empty-card"><span>✦</span><strong>Nothing to return right now</strong><p>Scan a receipt and we’ll keep an eye on the dates.</p></div>
+        } @else {
+          <div class="receipt-list">
+            @for (receipt of activeReturns; track receipt.id) {
+              <button class="receipt-card" type="button" (click)="selectReceipt(receipt)">
+                <span class="store-badge" [style.--badge-color]="categoryColor($index)">{{ categoryIcon(receipt.category) }}</span>
+                <span class="receipt-main">
+                  <span class="receipt-title">{{ receipt.store_name }}</span>
+                  <span class="receipt-meta">{{ receipt.purchase_date | date:'MMM d' }} <span class="meta-dot">·</span> {{ receipt.items.length }} {{ receipt.items.length === 1 ? 'item' : 'items' }}</span>
+                  <span class="return-countdown" [class.countdown-urgent]="getReturnDays(receipt) !== null && getReturnDays(receipt)! <= 7">
+                    <span class="countdown-dot"></span>
+                    @if (getReturnDays(receipt) === 0) { Last day to return }
+                    @else { {{ getReturnDays(receipt) }} days left to return }
+                  </span>
+                </span>
+                <span class="receipt-amount">{{ receipt.total_amount | currency:'USD' }}<span class="card-chevron">›</span></span>
+              </button>
+            }
+          </div>
+        }
+        @if (!isSignedIn) {
+          <p class="demo-footnote"><span>✦</span> Sample receipts shown in preview mode. Sign in to scan and sync your own.</p>
+        }
+      </section>
+    }
+
+    @if (activeView === 'insights') {
+      <section class="view-panel rise-in">
+        <div class="page-heading compact-heading">
+          <div><p class="eyebrow">YOUR MONEY, IN FOCUS</p><h1>Spending insights</h1><p class="heading-copy">A little clarity goes a long way.</p></div>
+        </div>
+        <div class="insight-card spend-overview">
+          <div class="overview-top"><span class="dark-label">TOTAL SPENDING</span><div class="period-switch"><button type="button" [class.selected]="period === 'week'" (click)="period = 'week'">Week</button><button type="button" [class.selected]="period === 'month'" (click)="period = 'month'">Month</button></div></div>
+          <strong class="big-total">{{ currentPeriodSpend | currency:'USD' }}</strong>
+          <span class="overview-caption">this {{ period }} <span>·</span> compared with the previous {{ period }}</span>
+          <div class="overview-decoration">↗</div>
+        </div>
+        <div class="section-heading insight-heading"><div><p class="eyebrow">CATEGORY BREAKDOWN</p><h2>Where it’s going</h2></div></div>
+        @if (spendSummary.length === 0) {
+          <div class="empty-card"><span>◌</span><strong>Your insights are on the way</strong><p>Scan receipts to see your spending trends.</p></div>
+        } @else {
+          <div class="category-list">
+            @for (entry of spendSummary; track entry.category; let i = $index) {
+              <article class="category-card">
+                <div class="category-top">
+                  <span class="category-icon" [style.--category-color]="categoryColor(i)">{{ categoryIcon(entry.category) }}</span>
+                  <span class="category-name">{{ entry.category }}</span>
+                  <strong>{{ entry.current | currency:'USD' }}</strong>
+                </div>
+                <div class="bar-track"><span class="bar-fill" [style.width.%]="(entry.current / maxCategorySpend) * 100" [style.--bar-color]="categoryColor(i)"></span></div>
+                <div class="category-bottom">
+                  <span>vs. {{ entry.previous | currency:'USD' }} last {{ period }}</span>
+                  @if (entry.variance === null) { <span class="variance-new">New this period</span> }
+                  @else { <span [class.variance-up]="entry.variance > 0" [class.variance-down]="entry.variance < 0">{{ entry.variance > 0 ? '+' : '' }}{{ entry.variance | number:'1.0-0' }}%</span> }
+                </div>
+              </article>
+            }
+          </div>
+          @for (entry of spendSummary; track entry.category) {
+            @if (entry.warning) {
+              <aside class="velocity-warning"><span class="warning-icon">↗</span><div><small>SPENDING VELOCITY</small><strong>{{ entry.variance === null ? 'New spending' : (entry.variance | number:'1.0-0') + '% more' }} on {{ entry.category }} this {{ period }}</strong><p>{{ entry.variance === null ? 'You made a purchase in a category with no spend last period.' : 'That’s more than 10% above your previous ' + period + '.' }}</p></div></aside>
+            }
+          }
+        }
+        <p class="insight-disclaimer">Insights compare purchases recorded in SmartReceipt. Saved records are account-scoped; AI providers process scans. See Profile for details.</p>
+      </section>
+    }
+
+    @if (activeView === 'warranties') {
+      <section class="view-panel rise-in">
+        <div class="page-heading compact-heading">
+          <div><p class="eyebrow">PROTECTION THAT STICKS</p><h1>Warranty watch</h1><p class="heading-copy">Know what’s covered — and for how long.</p></div>
+          <span class="warranty-count">{{ activeWarranties.length }} active</span>
+        </div>
+        @if (activeWarranties.length === 0) {
+          <div class="empty-card"><span>⬡</span><strong>No active warranties yet</strong><p>Warranty dates from your receipts will show up here.</p><button class="subtle-button" type="button" (click)="setView('tracker')">Scan a receipt</button></div>
+        } @else {
+          <div class="warranty-list">
+            @for (receipt of activeWarranties; track receipt.id) {
+              <article class="warranty-card">
+                <div class="warranty-card-top"><span class="warranty-shield">⬡</span><span class="warranty-status">COVERED · {{ getWarrantyDays(receipt) }} DAYS LEFT</span></div>
+                <p class="eyebrow">{{ receipt.store_name }}</p>
+                <h2>{{ receipt.items.length ? receipt.items[0].item_name : receipt.category }}</h2>
+                <div class="warranty-card-bottom"><span>Purchased {{ receipt.purchase_date | date:'MMM d, y' }}</span><strong>Until {{ receipt.warranty_expiration | date:'MMM d, y' }}</strong></div>
+                <button class="warranty-detail-button" type="button" (click)="selectReceipt(receipt)">View receipt &amp; return pass <span>↗</span></button>
+              </article>
+            }
+          </div>
+        }
+      </section>
+    }
+
+    @if (activeView === 'profile') {
+      <section class="view-panel rise-in">
+        <div class="page-heading compact-heading">
+          <div><p class="eyebrow">YOUR SMARTRECEIPT</p><h1>Profile &amp; settings</h1><p class="heading-copy">Your receipts stay private and yours.</p></div>
+        </div>
+        <article class="profile-card">
+          <div class="profile-avatar">{{ isSignedIn ? (receiptsApi.profile?.email?.slice(0, 1) ?? 'Y').toUpperCase() : 'Y' }}</div>
+          <div><span class="dark-label">{{ isSignedIn ? 'SIGNED IN AS' : 'PREVIEW ACCOUNT' }}</span><strong class="profile-email">{{ receiptsApi.profile?.email ?? 'Your personal receipt space' }}</strong></div>
+          <span class="profile-check">{{ isSignedIn ? '✓' : '✦' }}</span>
+        </article>
+        <article class="alias-card">
+          <div class="alias-symbol">✉</div><div class="alias-content"><p class="eyebrow">YOUR INBOX FOR RECEIPTS</p><h2>Forward it. We’ll file it.</h2><p>Send online orders and e-receipts to your personal SmartReceipt address.</p>
+            <div class="alias-address">{{ alias }} @if (isSignedIn) { <button type="button" (click)="copyAlias()" aria-label="Copy email alias">▢</button> }</div>
+          </div>
+        </article>
+        @if (!isSignedIn) {
+          <article class="signin-card">
+            <div class="signin-heading"><span>✦</span><div><strong>Keep your receipts in sync</strong><p>Sign in with a secure link sent to your email.</p></div></div>
+            <form class="signin-form" (ngSubmit)="signIn()">
+              <label class="visually-hidden" for="email-address">Email address</label>
+              <input id="email-address" name="email" type="email" autocomplete="email" [(ngModel)]="email" placeholder="you@example.com" required>
+              <button type="submit" [disabled]="!email.trim()">Send sign-in link <span>↗</span></button>
+            </form>
+            @if (emailSent) { <p class="signin-sent" role="status">Check your inbox for a secure sign-in link.</p> }
+          </article>
+        } @else {
+          <button class="signout-button" type="button" (click)="signOut()">Sign out</button>
+        }
+        <div class="settings-list">
+          <div><span class="settings-icon">⌁</span><span><strong>Account-scoped storage</strong><small>Your saved receipt records are protected by account-level access rules.</small></span><span class="settings-check">✓</span></div>
+          <div><span class="settings-icon">✦</span><span><strong>AI scan processing</strong><small>Receipt images and email text are sent to Gemini for extraction.</small></span><span class="settings-check">✓</span></div>
+          <div><span class="settings-icon">⌂</span><span><strong>Return reminders</strong><small>Return dates are calculated at scan time.</small></span><span class="settings-check">✓</span></div>
+          <div><span class="settings-icon">↻</span><span><strong>Price watch</strong><small>Price-match tracking is a demo estimate.</small></span><span class="settings-check">✓</span></div>
+        </div>
+        <p class="profile-version">SMARTRECEIPT · YOUR PURCHASES, PROTECTED</p>
+      </section>
+    }
+  </main>
+
+  <nav class="bottom-nav" aria-label="Main navigation">
+    @for (view of views; track view.id) {
+      <button type="button" [class.active]="activeView === view.id" (click)="setView(view.id)" [attr.aria-current]="activeView === view.id ? 'page' : null">
+        <span class="nav-icon">{{ view.icon }}</span><span>{{ view.label }}</span>
+      </button>
+    }
+  </nav>
+
+  @if (selectedReceipt; as receipt) {
+    <div class="sheet-backdrop" (click)="closeReceipt()">
+      <section class="detail-sheet" role="dialog" aria-modal="true" aria-labelledby="receipt-detail-title" (click)="$event.stopPropagation()" (keydown.escape)="closeReceipt()">
+        <div class="sheet-handle"></div>
+        <button class="sheet-close" type="button" aria-label="Close receipt details" (click)="closeReceipt()">×</button>
+        <p class="eyebrow">RETURN PASSPORT</p>
+        <div class="detail-heading">
+          <span class="store-badge detail-store-badge" [style.--badge-color]="categoryColor(1)">{{ categoryIcon(receipt.category) }}</span>
+          <div><h2 id="receipt-detail-title">{{ receipt.store_name }}</h2><p>{{ receipt.purchase_date | date:'MMMM d, y' }} <span>·</span> {{ receipt.transaction_id ?? receipt.id }}</p></div>
+        </div>
+        <div class="detail-total"><span>Total paid</span><strong>{{ receipt.total_amount | currency:'USD' }}</strong></div>
+        <div class="detail-items">
+          @for (item of receipt.items; track item.id) {
+            <div><span>{{ item.item_name }} <small>×{{ item.quantity }}</small></span><strong>{{ item.price * item.quantity | currency:'USD' }}</strong>
+              @if (item.price_alert?.status === 'active') { <small class="price-drop-label">PRICE DROP · {{ item.price_alert?.lowest_found_price | currency:'USD' }}</small> }
+            </div>
+          }
+        </div>
+        <div class="return-window-editor">
+          <div><strong>Return by</strong><small>{{ retailerWindow(receipt) === null ? 'Set or adjust the return deadline' : retailerWindow(receipt) + '-day retailer window' }}</small></div>
+          <label><span class="visually-hidden">Custom return deadline</span><input type="date" [(ngModel)]="customDeadline" [min]="receipt.purchase_date" aria-label="Custom return deadline"></label>
+        </div>
+        <button class="save-window-button" type="button" [disabled]="!isSignedIn" (click)="saveCustomWindow()">{{ isSignedIn ? 'Save return date' : 'Sign in to save changes' }}</button>
+        <div class="return-pass">
+          <div class="qr-wrap">@if (receiptQr) { <img [src]="receiptQr" alt="QR code with receipt verification and item details"> } @else { <span class="loading-spinner"></span> }</div>
+          <div><p class="eyebrow">YOUR RETURN PASS</p><strong>Ready when you are.</strong><p>Show this code with your itemized proof of purchase.</p><span class="verified-label">          <span>✓</span> PURCHASE DATA INCLUDED</span></div>
+        </div>
+        <button class="dispute-button" type="button" (click)="packageDispute(receipt)"><span>✉</span> Package dispute evidence <span class="button-arrow">↗</span></button>
+        <p class="detail-legal-note">Creates an editable email draft. Confirm the details before sending.</p>
+      </section>
+    </div>
+  }
+</div>
